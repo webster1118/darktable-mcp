@@ -6,7 +6,6 @@ import os
 import json
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -60,13 +59,14 @@ def _load_or_new(image_path: str) -> tuple[Path, EditState]:
     return path, state
 
 
-def _quick_preview(path: Path, state: EditState, max_size: int) -> Image:
+def _quick_preview(path: Path, state: EditState, max_size: int):
     """
     Render a preview using Darktable for RAW files so Claude sees the same
     rendering engine that is used for the final RAW export.
 
     Raster images continue to use the existing Pillow-based pipeline.
     """
+
     # RAW files MUST go through Darktable.
     if path.suffix.lower() in RAW_EXTENSIONS:
         if not DARKTABLE_CLI:
@@ -79,29 +79,41 @@ def _quick_preview(path: Path, state: EditState, max_size: int) -> Image:
         # Create/update the Darktable XMP from the current MCP edit state.
         xmp_path = write_xmp(state)
 
-        with tempfile.TemporaryDirectory(
-            prefix="darktable_mcp_preview_"
-        ) as tmp:
-            tmp_dir = Path(tmp)
-            preview_path = tmp_dir / f"{path.stem}__preview.jpg"
+        # Use a predictable local cache directory instead of %TEMP%.
+        preview_dir = path.parent / ".darktable-mcp-preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
 
-            result = _export_via_darktable_cli(
-                src=path,
-                dst=preview_path,
-                xmp=xmp_path,
-                quality=85,
-                max_dimension=max_size,
+        preview_path = preview_dir / f"{path.stem}__preview.jpg"
+
+        # Delete an old preview so we know the output was freshly rendered.
+        if preview_path.exists():
+            try:
+                preview_path.unlink()
+            except OSError:
+                pass
+
+        result = _export_via_darktable_cli(
+            src=path,
+            dst=preview_path,
+            xmp=xmp_path,
+            quality=85,
+            max_dimension=max_size,
+        )
+
+        if result.get("status") != "ok":
+            raise RuntimeError(
+                "Darktable failed to render the RAW preview: "
+                + str(result)
             )
 
-            if result.get("status") != "ok":
-                raise RuntimeError(
-                    "Darktable failed to render the RAW preview: "
-                    + str(result)
-                )
+        if not preview_path.exists():
+            raise RuntimeError(
+                f"Darktable reported success but preview was not created: "
+                f"{preview_path}"
+            )
 
-            img_bytes = preview_path.read_bytes()
+        img_bytes = preview_path.read_bytes()
 
-        # Return a normal MCP Image plus the raw JPEG bytes.
         return Image(data=img_bytes, format="jpeg"), img_bytes
 
     # Non-RAW files can continue to use the existing Pillow pipeline.
@@ -159,7 +171,14 @@ def list_images(directory: str) -> list[dict]:
 
 @mcp.tool()
 def get_image_info(image_path: str) -> dict:
-    """Return detailed metadata (EXIF, dimensions, camera info) and current edit state for an image."""
+    """
+        Return detailed metadata (EXIF, dimensions, camera info) and current edit state for an image.
+        
+        IMPORTANT:
+        Claude does NOT need direct access to the file.
+        Pass the absolute Windows path to the MCP server.
+        The MCP server reads the file and returns the preview.
+    """
     try:
         path, state = _load_or_new(image_path)
     except FileNotFoundError as e:
@@ -175,6 +194,11 @@ def get_image_info(image_path: str) -> dict:
 @mcp.tool()
 def get_image_preview(image_path: str, max_size: int = 1200) -> list:
     """Render the image with current edits.
+
+    IMPORTANT:
+    Claude does NOT need direct access to the file.
+    Pass the absolute Windows path to the MCP server.
+    The MCP server reads the file and returns the preview.
 
     RAW/DNG files are rendered through Darktable CLI so the preview shown
     to Claude uses the same RAW rendering engine as the final export.
@@ -232,6 +256,11 @@ def apply_adjustments(
 ) -> dict:
     """Apply one or more non-destructive adjustments to an image.
 
+    IMPORTANT:
+    Claude does NOT need direct access to the file.
+    Pass the absolute Windows path to the MCP server.
+    The MCP server reads the file and returns the preview.
+        
     Only the parameters you supply are changed; the rest keep their current values.
     Call get_image_preview afterwards to see the result.
 
@@ -459,6 +488,11 @@ def export_image(
 ) -> dict:
     """Export the edited image to a file.
 
+    IMPORTANT:
+    Claude does NOT need direct access to the file.
+    Pass the absolute Windows path to the MCP server.
+    The MCP server reads the file and returns the preview.
+
     Parameters
     ----------
     image_path : str
@@ -589,8 +623,8 @@ def _export_via_darktable_cli(
     """
     Render/export an image using darktable-cli.
 
-    Compatible with current darktable 5.6 CLI syntax.
-    JPEG quality is passed via --core --conf rather than --quality.
+    Windows paths are converted to forward-slash form before being passed
+    to darktable-cli. This avoids backslash escaping/path parsing problems.
     """
 
     if not DARKTABLE_CLI:
@@ -599,24 +633,30 @@ def _export_via_darktable_cli(
             "error": "darktable-cli is not available",
         }
 
+    src = Path(src).resolve()
+    dst = Path(dst).resolve()
+
     width = str(max_dimension) if max_dimension else "0"
     height = str(max_dimension) if max_dimension else "0"
 
-    # darktable-cli determines the output format from the output extension.
-    # For JPEG, quality is configured through the darktable core:
-    #
-    # --core --conf plugins/imageio/format/jpeg/quality=<value>
-    #
+    # IMPORTANT:
+    # Use forward slashes for Windows paths passed to darktable-cli.
+    darktable_exe = Path(DARKTABLE_CLI).resolve().as_posix()
+
+    src_arg = src.as_posix()
+    dst_arg = dst.as_posix()
+    
     cmd = [
-        DARKTABLE_CLI,
-        str(src),
+        darktable_exe,
+        src_arg,
     ]
 
     if xmp:
-        cmd.append(str(xmp))
+        xmp_arg = Path(xmp).resolve().as_posix()
+        cmd.append(xmp_arg)
 
     cmd.extend([
-        str(dst),
+        dst_arg,
         "--width",
         width,
         "--height",
@@ -687,6 +727,11 @@ def _export_via_darktable_cli(
 def get_histogram(image_path: str) -> dict:
     """Compute a brightness/channel histogram for the image (with current edits).
 
+    IMPORTANT:
+    Claude does NOT need direct access to the file.
+    Pass the absolute Windows path to the MCP server.
+    The MCP server reads the file and returns the preview.
+        
     Returns per-channel (R, G, B) and luminance histograms as 256-bin arrays.
     Useful for analysing exposure, clipping, and tonal distribution.
     """
