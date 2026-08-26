@@ -587,67 +587,100 @@ def _export_via_darktable_cli(
     max_dimension: Optional[int] = None,
 ) -> dict:
     """
-    Render/export an image using Darktable CLI.
+    Render/export an image using darktable-cli.
 
-    If max_dimension is supplied, Darktable constrains both width and height
-    to that value while preserving aspect ratio.
+    Compatible with current darktable 5.6 CLI syntax.
+    JPEG quality is passed via --core --conf rather than --quality.
     """
+
+    if not DARKTABLE_CLI:
+        return {
+            "status": "error",
+            "error": "darktable-cli is not available",
+        }
 
     width = str(max_dimension) if max_dimension else "0"
     height = str(max_dimension) if max_dimension else "0"
 
+    # darktable-cli determines the output format from the output extension.
+    # For JPEG, quality is configured through the darktable core:
+    #
+    # --core --conf plugins/imageio/format/jpeg/quality=<value>
+    #
     cmd = [
         DARKTABLE_CLI,
         str(src),
-        str(xmp) if xmp else "",
+    ]
+
+    if xmp:
+        cmd.append(str(xmp))
+
+    cmd.extend([
         str(dst),
         "--width",
         width,
         "--height",
         height,
-        "--quality",
-        str(quality),
-    ]
+        "--hq",
+        "true",
+        "--core",
+        "--conf",
+        f"plugins/imageio/format/jpeg/quality={quality}",
+    ])
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
+            check=False,
         )
-
-        if result.returncode == 0 and dst.exists():
-            return {
-                "status": "ok",
-                "output_path": str(dst),
-                "rendered_via": "darktable-cli",
-                "size_bytes": dst.stat().st_size,
-                "stdout": result.stdout[-1000:],
-                "stderr": result.stderr[-1000:],
-            }
-
-        return {
-            "status": "error",
-            "returncode": result.returncode,
-            "stderr": result.stderr[-2000:],
-            "stdout": result.stdout[-2000:],
-            "command": cmd,
-        }
 
     except subprocess.TimeoutExpired:
         return {
             "status": "error",
-            "error": "darktable-cli timed out after 120 seconds.",
+            "error": "darktable-cli timed out after 180 seconds.",
             "command": cmd,
         }
 
-    except Exception as exc:
+    except OSError as exc:
         return {
             "status": "error",
-            "exception": str(exc),
+            "error": f"Could not start darktable-cli: {exc}",
             "command": cmd,
         }
+
+    if result.returncode != 0:
+        return {
+            "status": "error",
+            "error": "darktable-cli failed.",
+            "returncode": result.returncode,
+            "stdout": result.stdout[-3000:],
+            "stderr": result.stderr[-3000:],
+            "command": cmd,
+        }
+
+    if not dst.exists():
+        return {
+            "status": "error",
+            "error": (
+                "darktable-cli returned success but did not create "
+                f"the expected output file: {dst}"
+            ),
+            "stdout": result.stdout[-3000:],
+            "stderr": result.stderr[-3000:],
+            "command": cmd,
+        }
+
+    return {
+        "status": "ok",
+        "output_path": str(dst),
+        "rendered_via": "darktable-cli",
+        "size_bytes": dst.stat().st_size,
+        "stdout": result.stdout[-1000:],
+        "stderr": result.stderr[-1000:],
+    }
 
 
 @mcp.tool()
