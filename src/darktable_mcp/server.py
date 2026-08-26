@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from mcp.server.mcpserver import MCPServer, Image
+from PIL import Image as PILImage
 
 from .edits import CropState, EditState
 from .processor import ALL_EXTENSIONS, RAW_EXTENSIONS, ImageProcessor
@@ -38,11 +39,57 @@ def _load_or_new(image_path: str) -> tuple[Path, EditState]:
 
 
 def _quick_preview(path: Path, state: EditState, max_size: int) -> Image:
+    """
+    Render a preview using Darktable for RAW files so Claude sees the same
+    rendering engine that is used for the final RAW export.
+
+    Raster images continue to use the existing Pillow-based pipeline.
+    """
+    # RAW files MUST go through Darktable.
+    if path.suffix.lower() in RAW_EXTENSIONS:
+        if not DARKTABLE_CLI:
+            raise RuntimeError(
+                "Darktable CLI was not found. "
+                "RAW previews require darktable-cli; "
+                "rawpy is intentionally not used for RAW previews."
+            )
+
+        # Create/update the Darktable XMP from the current MCP edit state.
+        xmp_path = write_xmp(state)
+
+        with tempfile.TemporaryDirectory(
+            prefix="darktable_mcp_preview_"
+        ) as tmp:
+            tmp_dir = Path(tmp)
+            preview_path = tmp_dir / f"{path.stem}__preview.jpg"
+
+            result = _export_via_darktable_cli(
+                src=path,
+                dst=preview_path,
+                xmp=xmp_path,
+                quality=85,
+                max_dimension=max_size,
+            )
+
+            if result.get("status") != "ok":
+                raise RuntimeError(
+                    "Darktable failed to render the RAW preview: "
+                    + str(result)
+                )
+
+            img_bytes = preview_path.read_bytes()
+
+        # Return a normal MCP Image plus the raw JPEG bytes.
+        return Image(data=img_bytes, format="jpeg"), img_bytes
+
+    # Non-RAW files can continue to use the existing Pillow pipeline.
     proc = ImageProcessor(path)
     img = proc.process(state, preview_size=max_size)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
-    return img, buf.getvalue()
+
+    return Image(data=buf.getvalue(), format="jpeg"), buf.getvalue()
 
 
 def _save_and_open_preview(path: Path, img_bytes: bytes) -> str:
@@ -105,23 +152,30 @@ def get_image_info(image_path: str) -> dict:
 
 @mcp.tool()
 def get_image_preview(image_path: str, max_size: int = 1200) -> list:
-    """Render the image with all current edits applied, save a preview file, and open it.
+    """Render the image with current edits.
 
-    Saves a __preview.jpg next to the source and opens it in the Windows image
-    viewer so the user can see it immediately.  Also returns the image so Claude
-    can analyse it and suggest further improvements.
-    *max_size* controls the longest edge of the preview in pixels (default 1200).
+    RAW/DNG files are rendered through Darktable CLI so the preview shown
+    to Claude uses the same RAW rendering engine as the final export.
+
+    JPEG/PNG/etc. continue to use the existing Pillow pipeline.
     """
     try:
         path, state = _load_or_new(image_path)
     except FileNotFoundError as e:
         return [f"Error: {e}"]
 
-    _img, img_bytes = _quick_preview(path, state, max_size)
+    try:
+        _img, img_bytes = _quick_preview(path, state, max_size)
+    except Exception as e:
+        return [f"Error rendering preview: {e}"]
+
     preview_path = _save_and_open_preview(path, img_bytes)
 
     return [
-        f"Preview saved to: {preview_path}\nOpening in your image viewer now...",
+        (
+            f"Preview saved to: {preview_path}\n"
+            "Opening in your image viewer now..."
+        ),
         Image(data=img_bytes, format="jpeg"),
     ]
 
@@ -427,28 +481,69 @@ def export_image(
         except Exception as exc:
             xmp_path = None  # non-fatal
 
-    # Try darktable-cli first for RAW files
-    if use_darktable_cli and DARKTABLE_CLI and path.suffix.lower() in RAW_EXTENSIONS:
-        result = _export_via_darktable_cli(path, out_path, xmp_path, quality)
+        # RAW files: use Darktable exclusively.
+    if path.suffix.lower() in RAW_EXTENSIONS:
+        if not use_darktable_cli:
+            return {
+                "status": "error",
+                "error": (
+                    "RAW export requires darktable-cli for this workflow. "
+                    "The rawpy fallback is disabled to keep preview and "
+                    "final rendering consistent."
+                ),
+            }
+
+        if not DARKTABLE_CLI:
+            return {
+                "status": "error",
+                "error": (
+                    "darktable-cli was not found. "
+                    "RAW export cannot continue without Darktable."
+                ),
+            }
+
+        result = _export_via_darktable_cli(
+            src=path,
+            dst=out_path,
+            xmp=xmp_path,
+            quality=quality,
+            max_dimension=max_dimension,
+        )
+
         if result.get("status") == "ok":
             result["xmp_sidecar"] = str(xmp_path) if xmp_path else None
             return result
 
-    # Fall back to rawpy + Pillow
+        return {
+            "status": "error",
+            "error": "Darktable RAW export failed.",
+            "details": result,
+            "xmp_sidecar": str(xmp_path) if xmp_path else None,
+        }
+
+    # Non-RAW files continue with the Pillow path.
     proc = ImageProcessor(path)
     img = proc.process(state)
 
     if max_dimension:
-        from PIL import Image as PILImage
         img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
 
     save_kwargs: dict = {}
     if format.lower() in ("jpeg", "jpg"):
-        save_kwargs = {"format": "JPEG", "quality": quality, "optimize": True}
+        save_kwargs = {
+            "format": "JPEG",
+            "quality": quality,
+            "optimize": True,
+        }
     elif format.lower() == "png":
-        save_kwargs = {"format": "PNG", "optimize": True}
+        save_kwargs = {
+            "format": "PNG",
+            "optimize": True,
+        }
     elif format.lower() in ("tiff", "tif"):
-        save_kwargs = {"format": "TIFF"}
+        save_kwargs = {
+            "format": "TIFF"
+        }
 
     img.save(out_path, **save_kwargs)
 
@@ -458,28 +553,79 @@ def export_image(
         "format": format,
         "size_bytes": out_path.stat().st_size,
         "xmp_sidecar": str(xmp_path) if xmp_path else None,
-        "rendered_via": "rawpy+pillow",
+        "rendered_via": "pillow",
     }
 
 
 def _export_via_darktable_cli(
-    src: Path, dst: Path, xmp: Optional[Path], quality: int
+    src: Path,
+    dst: Path,
+    xmp: Optional[Path],
+    quality: int,
+    max_dimension: Optional[int] = None,
 ) -> dict:
-    cmd = [DARKTABLE_CLI, str(src), str(xmp) if xmp else "", str(dst),
-           "--width", "0", "--height", "0",
-           "--quality", str(quality)]
+    """
+    Render/export an image using Darktable CLI.
+
+    If max_dimension is supplied, Darktable constrains both width and height
+    to that value while preserving aspect ratio.
+    """
+
+    width = str(max_dimension) if max_dimension else "0"
+    height = str(max_dimension) if max_dimension else "0"
+
+    cmd = [
+        DARKTABLE_CLI,
+        str(src),
+        str(xmp) if xmp else "",
+        str(dst),
+        "--width",
+        width,
+        "--height",
+        height,
+        "--quality",
+        str(quality),
+    ]
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
         if result.returncode == 0 and dst.exists():
             return {
                 "status": "ok",
                 "output_path": str(dst),
                 "rendered_via": "darktable-cli",
                 "size_bytes": dst.stat().st_size,
+                "stdout": result.stdout[-1000:],
+                "stderr": result.stderr[-1000:],
             }
-        return {"status": "error", "stderr": result.stderr[:500]}
+
+        return {
+            "status": "error",
+            "returncode": result.returncode,
+            "stderr": result.stderr[-2000:],
+            "stdout": result.stdout[-2000:],
+            "command": cmd,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "error": "darktable-cli timed out after 120 seconds.",
+            "command": cmd,
+        }
+
     except Exception as exc:
-        return {"status": "error", "exception": str(exc)}
+        return {
+            "status": "error",
+            "exception": str(exc),
+            "command": cmd,
+        }
 
 
 @mcp.tool()
@@ -496,9 +642,13 @@ def get_histogram(image_path: str) -> dict:
     except FileNotFoundError as e:
         return {"error": str(e)}
 
-    proc = ImageProcessor(path)
-    img = proc.process(state, preview_size=800)
-    arr = np.array(img, dtype=np.uint8)
+    try:
+        _img, img_bytes = _quick_preview(path, state, 800)
+        with PILImage.open(io.BytesIO(img_bytes)) as preview_img:
+            img = preview_img.convert("RGB")
+            arr = np.array(img, dtype=np.uint8)
+    except Exception as e:
+        return {"error": f"Could not render histogram source image: {e}"}
 
     def _hist(channel: np.ndarray) -> list[int]:
         counts, _ = np.histogram(channel.ravel(), bins=256, range=(0, 256))
