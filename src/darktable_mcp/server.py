@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import os
 import json
 import shutil
 import subprocess
@@ -23,9 +24,29 @@ mcp = MCPServer("DarktableMCP")
 
 
 def _find_dt_cli_windows() -> Optional[str]:
-    candidate = r"C:\Program Files\darktable\bin\darktable-cli.exe"
-    return candidate if Path(candidate).exists() else None
+    """Find darktable-cli.exe on Windows."""
 
+    candidates = [
+        # User installation
+        Path.home() / "AppData" / "Local" / "Programs" / "darktable" / "bin" / "darktable-cli.exe",
+
+        # Standard machine installation
+        Path(r"C:\Program Files\darktable\bin\darktable-cli.exe"),
+
+        # 32-bit installation
+        Path(r"C:\Program Files (x86)\darktable\bin\darktable-cli.exe"),
+
+        # Explicit environment variable
+        Path(os.environ["DARKTABLE_CLI"])
+        if os.environ.get("DARKTABLE_CLI")
+        else None,
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return str(candidate)
+
+    return None
 
 DARKTABLE_CLI = shutil.which("darktable-cli") or _find_dt_cli_windows()
 
