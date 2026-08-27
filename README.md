@@ -26,7 +26,21 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 ## Requirements
 
 - Python 3.10 or newer
+- [Darktable 5.6](https://www.darktable.org/install/) for RAW/DNG previews and exports
 - [Claude Desktop](https://claude.ai/download) (free or Pro)
+
+The server discovers `darktable-cli` automatically, including the standard
+per-user Windows installation. If yours is elsewhere, set `DARKTABLE_CLI` to
+the full path of `darktable-cli.exe`. Each render uses an isolated temporary
+Darktable configuration, so it can run while the Darktable desktop application
+is open without competing for its catalog lock.
+
+Apple ProRAW DNGs can be converted before rendering with Adobe DNG Converter.
+The server discovers the normal Windows install path automatically; set
+`ADOBE_DNG_CONVERTER` if it is installed elsewhere. Conversion defaults to
+`DARKTABLE_MCP_DNG_CONVERSION=auto`: likely Apple ProRAW DNGs are converted
+up front, and other DNGs are retried through Adobe if Darktable rejects them.
+Use `always` or `never` to force or disable this preprocessing.
 
 ---
 
@@ -135,13 +149,17 @@ Claude will:
 |------|-------------|
 | `list_images` | List all images in a directory |
 | `get_image_info` | EXIF metadata + current edit state |
+| `get_darktable_status` | Show Darktable CLI discovery and supported v2 edit routing |
 | `get_image_preview` | Render and preview with edits applied |
-| `apply_adjustments` | Exposure, WB, tone, colour, detail, effects |
+| `apply_adjustments` | Exposure, WB, tone, colour, detail, dehaze, effects |
 | `crop_image` | Crop by coordinates or aspect ratio |
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
+| `add_gradient_mask` | Add or replace a reusable local gradient adjustment |
+| `reset_masks` | Remove all local masks |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF |
+| `edit_vacation_photo` | Apply the restrained vacation-photo profile and export a 16:9 JPEG |
 | `reset_edits` | Undo everything, back to original |
 | `get_histogram` | Tonal/clipping analysis |
 | `copy_settings` | Copy edits from one image to another |
@@ -161,7 +179,13 @@ Claude will:
 
 Each image gets a companion `.mcp.json` sidecar file (e.g. `IMG_3500.mcp.json`) that stores all adjustments non-destructively. Your original RAW files are never modified.
 
-On export, a Darktable-compatible `.xmp` sidecar is also written, so you can open the RAW in Darktable and see the edits there too.
+On RAW/DNG export, Darktable handles the RAW render through `darktable-cli`.
+The MCP writes a Darktable-compatible `.xmp` sidecar for verified Darktable 5.6
+module payloads including exposure, white balance/temperature, basic tone,
+color balance RGB, sigmoid, haze removal, simple crop, sharpen, and vignette.
+Shadows/whites/blacks use tone equalizer, denoise uses profiled denoise, and
+clarity uses local contrast. Local masks and rotated crops still use the MCP
+finishing pass until their native Darktable payloads are verified.
 
 ---
 

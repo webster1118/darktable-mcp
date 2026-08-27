@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
 
-from .edits import EditState, AdjustmentState, CropState
+from .edits import EditState, AdjustmentState, CropState, LocalAdjustmentState
 
 RAW_EXTENSIONS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".rw2", ".dng", ".orf", ".pef", ".srw", ".3fr"}
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
@@ -70,6 +70,20 @@ def _apply_lut(img: Image.Image, lut: np.ndarray) -> Image.Image:
     return Image.fromarray(arr.astype(np.uint8))
 
 
+def _build_sigmoid_lut(contrast: float, skew: float = 0.0) -> np.ndarray:
+    """Build a normalized S-curve similar in spirit to darktable sigmoid."""
+    x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    slope = 1.0 + abs(contrast) / 100.0 * 7.0
+    midpoint = np.clip(0.5 + skew / 100.0 * 0.25, 0.2, 0.8)
+    y = 1.0 / (1.0 + np.exp(-slope * (x - midpoint)))
+    y_min = 1.0 / (1.0 + np.exp(-slope * (0.0 - midpoint)))
+    y_max = 1.0 / (1.0 + np.exp(-slope * (1.0 - midpoint)))
+    y = (y - y_min) / (y_max - y_min)
+    if contrast < 0:
+        y = x + (x - y) * abs(contrast) / 100.0
+    return np.clip(y * 255.0, 0, 255).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Per-effect Pillow helpers
 # ---------------------------------------------------------------------------
@@ -114,6 +128,28 @@ def _apply_clarity(img: Image.Image, clarity: float) -> Image.Image:
         return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=int(amount * 80), threshold=2))
     else:
         return img.filter(ImageFilter.GaussianBlur(radius=amount * 3))
+
+
+def _apply_dehaze(img: Image.Image, strength: float) -> Image.Image:
+    """Reduce haze with restrained contrast stretching and local contrast."""
+    if strength < 1.0:
+        return img
+
+    amount = min(strength, 100.0) / 100.0
+    arr = np.array(img, dtype=np.float32)
+    low = np.percentile(arr, 1, axis=(0, 1))
+    high = np.percentile(arr, 99, axis=(0, 1))
+    stretched = (arr - low) / np.maximum(high - low, 1.0) * 255.0
+    arr = arr * (1.0 - amount * 0.55) + stretched * (amount * 0.55)
+
+    blur = np.array(
+        Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).filter(
+            ImageFilter.GaussianBlur(radius=18)
+        ),
+        dtype=np.float32,
+    )
+    arr = arr + (arr - blur) * amount * 0.45
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
 def _apply_vibrance(img: Image.Image, vibrance: float) -> Image.Image:
@@ -162,6 +198,43 @@ def _apply_noise_reduction(img: Image.Image, strength: float) -> Image.Image:
     return img.filter(ImageFilter.GaussianBlur(radius=radius))
 
 
+def _local_to_adjustment(local: LocalAdjustmentState) -> AdjustmentState:
+    return AdjustmentState(
+        brightness=local.brightness,
+        contrast=local.contrast,
+        highlights=local.highlights,
+        shadows=local.shadows,
+        whites=local.whites,
+        blacks=local.blacks,
+        sigmoid_contrast=local.sigmoid_contrast,
+        sigmoid_skew=local.sigmoid_skew,
+        saturation=local.saturation,
+        vibrance=local.vibrance,
+        clarity=local.clarity,
+        dehaze=local.dehaze,
+    )
+
+
+def _linear_gradient_mask(size: tuple[int, int], local: LocalAdjustmentState) -> np.ndarray:
+    width, height = size
+    x0 = float(np.clip(local.start_x, 0.0, 1.0)) * max(width - 1, 1)
+    y0 = float(np.clip(local.start_y, 0.0, 1.0)) * max(height - 1, 1)
+    x1 = float(np.clip(local.end_x, 0.0, 1.0)) * max(width - 1, 1)
+    y1 = float(np.clip(local.end_y, 0.0, 1.0)) * max(height - 1, 1)
+    dx = x1 - x0
+    dy = y1 - y0
+    denom = dx * dx + dy * dy
+    if denom < 1e-6:
+        return np.ones((height, width), dtype=np.float32) * float(np.clip(local.opacity, 0.0, 1.0))
+
+    yy, xx = np.mgrid[0:height, 0:width]
+    mask = ((xx - x0) * dx + (yy - y0) * dy) / denom
+    mask = np.clip(mask, 0.0, 1.0).astype(np.float32)
+    if local.invert:
+        mask = 1.0 - mask
+    return mask * float(np.clip(local.opacity, 0.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # Main processor
 # ---------------------------------------------------------------------------
@@ -182,6 +255,7 @@ class ImageProcessor:
             img = self._process_raster(edit_state.adjustments)
 
         img = self._apply_post_raw(img, edit_state.adjustments)
+        img = self._apply_local_adjustments(img, edit_state.local_adjustments)
 
         if edit_state.crop:
             img = self._apply_crop(img, edit_state.crop)
@@ -204,13 +278,22 @@ class ImageProcessor:
                 with rawpy.imread(str(self.path)) as raw:
                     info["width"] = raw.sizes.width
                     info["height"] = raw.sizes.height
-                    info["camera"] = raw.metadata.camera
-                    info["iso"] = raw.metadata.iso
-                    info["shutter"] = raw.metadata.shutter
-                    info["aperture"] = raw.metadata.aperture
-                    info["focal_len"] = raw.metadata.focal_len
-                    info["timestamp"] = raw.metadata.timestamp
-                    info["raw_type"] = raw.raw_type.name
+                    if hasattr(raw, "metadata"):
+                        metadata = raw.metadata
+                        for attr, name in {
+                            "camera": "camera",
+                            "iso": "iso",
+                            "shutter": "shutter",
+                            "aperture": "aperture",
+                            "focal_len": "focal_len",
+                            "timestamp": "timestamp",
+                        }.items():
+                            value = getattr(metadata, attr, None)
+                            if value is not None:
+                                info[name] = value
+                    raw_type = getattr(raw, "raw_type", None)
+                    if raw_type is not None:
+                        info["raw_type"] = getattr(raw_type, "name", str(raw_type))
             else:
                 with Image.open(self.path) as img:
                     info["width"] = img.width
@@ -285,6 +368,11 @@ class ImageProcessor:
             lut = _build_shadow_highlight_lut(adj.highlights, adj.shadows, adj.whites, adj.blacks)
             img = _apply_lut(img, lut)
 
+        # Sigmoid-like contrast curve
+        if adj.sigmoid_contrast != 0.0 or adj.sigmoid_skew != 0.0:
+            lut = _build_sigmoid_lut(adj.sigmoid_contrast, adj.sigmoid_skew)
+            img = _apply_lut(img, lut)
+
         # Brightness (for non-RAW path it was already done; for RAW it's additive)
         if adj.brightness != 0.0:
             factor = 1.0 + adj.brightness / 100.0
@@ -308,6 +396,10 @@ class ImageProcessor:
         if adj.clarity != 0.0:
             img = _apply_clarity(img, adj.clarity)
 
+        # Dehaze
+        if adj.dehaze > 0:
+            img = _apply_dehaze(img, adj.dehaze)
+
         # Sharpness
         if adj.sharpness > 0:
             factor = 1.0 + adj.sharpness / 50.0
@@ -321,6 +413,29 @@ class ImageProcessor:
         if adj.vignette != 0.0:
             img = _apply_vignette(img, adj.vignette)
 
+        return img
+
+    def _apply_local_adjustments(
+        self,
+        img: Image.Image,
+        local_adjustments: list[LocalAdjustmentState],
+    ) -> Image.Image:
+        for local in local_adjustments:
+            if not local.enabled or not local.has_changes():
+                continue
+            if local.mask_type != "linear_gradient":
+                continue
+
+            adjusted = img
+            if local.exposure_ev != 0.0:
+                adjusted = ImageEnhance.Brightness(adjusted).enhance(2 ** local.exposure_ev)
+            adjusted = self._apply_post_raw(adjusted, _local_to_adjustment(local))
+
+            mask = _linear_gradient_mask(img.size, local)
+            base_arr = np.array(img, dtype=np.float32)
+            adjusted_arr = np.array(adjusted, dtype=np.float32)
+            out = base_arr * (1.0 - mask[..., None]) + adjusted_arr * mask[..., None]
+            img = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
         return img
 
     def _apply_crop(self, img: Image.Image, crop: CropState) -> Image.Image:

@@ -34,6 +34,8 @@ class AdjustmentState:
     shadows: float = 0.0      # -100 to +100
     whites: float = 0.0       # -100 to +100
     blacks: float = 0.0       # -100 to +100
+    sigmoid_contrast: float = 0.0  # -100 to +100
+    sigmoid_skew: float = 0.0      # -100 to +100
 
     # --- Colour ---
     saturation: float = 0.0   # -100 to +100
@@ -46,6 +48,51 @@ class AdjustmentState:
     # --- Effects ---
     vignette: float = 0.0   # -100 to +100 (negative = dark edges)
     clarity: float = 0.0    # -100 to +100 (local contrast)
+    dehaze: float = 0.0     # 0 to 100
+
+
+@dataclass
+class LocalAdjustmentState:
+    name: str
+    mask_type: str = "linear_gradient"
+    start_x: float = 0.5
+    start_y: float = 0.0
+    end_x: float = 0.5
+    end_y: float = 1.0
+    invert: bool = False
+    opacity: float = 1.0
+    enabled: bool = True
+    exposure_ev: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    highlights: float = 0.0
+    shadows: float = 0.0
+    whites: float = 0.0
+    blacks: float = 0.0
+    sigmoid_contrast: float = 0.0
+    sigmoid_skew: float = 0.0
+    saturation: float = 0.0
+    vibrance: float = 0.0
+    clarity: float = 0.0
+    dehaze: float = 0.0
+
+    def has_changes(self) -> bool:
+        defaults = LocalAdjustmentState(name=self.name)
+        return any([
+            self.exposure_ev != defaults.exposure_ev,
+            self.brightness != defaults.brightness,
+            self.contrast != defaults.contrast,
+            self.highlights != defaults.highlights,
+            self.shadows != defaults.shadows,
+            self.whites != defaults.whites,
+            self.blacks != defaults.blacks,
+            self.sigmoid_contrast != defaults.sigmoid_contrast,
+            self.sigmoid_skew != defaults.sigmoid_skew,
+            self.saturation != defaults.saturation,
+            self.vibrance != defaults.vibrance,
+            self.clarity != defaults.clarity,
+            self.dehaze != defaults.dehaze,
+        ])
 
 
 @dataclass
@@ -53,6 +100,7 @@ class EditState:
     source_path: Path
     adjustments: AdjustmentState = field(default_factory=AdjustmentState)
     crop: Optional[CropState] = None
+    local_adjustments: list[LocalAdjustmentState] = field(default_factory=list)
     output_name: Optional[str] = None  # stem only, no extension
 
     # ------------------------------------------------------------------
@@ -77,6 +125,14 @@ class EditState:
         state.adjustments = AdjustmentState(**valid)
         crop_data = data.get("crop")
         state.crop = CropState(**crop_data) if crop_data else None
+        local_items = data.get("local_adjustments", [])
+        state.local_adjustments = [
+            LocalAdjustmentState(**{
+                k: v for k, v in item.items()
+                if hasattr(LocalAdjustmentState(name=""), k)
+            })
+            for item in local_items
+        ]
         state.output_name = data.get("output_name")
         return state
 
@@ -85,6 +141,7 @@ class EditState:
         data = {
             "adjustments": asdict(self.adjustments),
             "crop": asdict(self.crop) if self.crop else None,
+            "local_adjustments": [asdict(item) for item in self.local_adjustments],
             "output_name": self.output_name,
         }
         with open(sidecar, "w") as f:
@@ -105,12 +162,17 @@ class EditState:
         return any([
             a.exposure_ev != defaults.exposure_ev,
             a.contrast != defaults.contrast,
+            a.sigmoid_contrast != defaults.sigmoid_contrast,
+            a.sigmoid_skew != defaults.sigmoid_skew,
             a.saturation != defaults.saturation,
             a.temperature_kelvin is not None,
             a.sharpness != defaults.sharpness,
             a.noise_reduction != defaults.noise_reduction,
             a.vignette != defaults.vignette,
+            a.clarity != defaults.clarity,
+            a.dehaze != defaults.dehaze,
             self.crop is not None,
+            any(item.enabled and item.has_changes() for item in self.local_adjustments),
             self.output_name is not None,
         ])
 
@@ -118,5 +180,6 @@ class EditState:
         return {
             "adjustments": asdict(self.adjustments),
             "crop": asdict(self.crop) if self.crop else None,
+            "local_adjustments": [asdict(item) for item in self.local_adjustments],
             "output_name": self.output_name,
         }

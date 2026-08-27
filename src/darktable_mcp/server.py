@@ -2,17 +2,16 @@
 from __future__ import annotations
 
 import io
-import os
-import json
-import shutil
-import subprocess
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 from mcp.server.mcpserver import MCPServer, Image
 from PIL import Image as PILImage
 
-from .edits import CropState, EditState
+from .darktable_cli import DarktableCli
+from .edits import CropState, EditState, LocalAdjustmentState
 from .processor import ALL_EXTENSIONS, RAW_EXTENSIONS, ImageProcessor
 from .xmp_writer import write_xmp
 
@@ -23,32 +22,23 @@ mcp = MCPServer("DarktableMCP")
 # ---------------------------------------------------------------------------
 
 
-def _find_dt_cli_windows() -> Optional[str]:
-    """Find darktable-cli.exe on Windows."""
+DARKTABLE = DarktableCli.discover()
 
-    candidates = [
-        # User installation
-        Path.home() / "AppData" / "Local" / "Programs" / "darktable" / "bin" / "darktable-cli.exe",
-
-        # Standard machine installation
-        Path(r"C:\Program Files\darktable\bin\darktable-cli.exe"),
-
-        # 32-bit installation
-        Path(r"C:\Program Files (x86)\darktable\bin\darktable-cli.exe"),
-
-        # Explicit environment variable
-        Path(os.environ["DARKTABLE_CLI"])
-        if os.environ.get("DARKTABLE_CLI")
-        else None,
-    ]
-
-    for candidate in candidates:
-        if candidate and candidate.is_file():
-            return str(candidate)
-
-    return None
-
-DARKTABLE_CLI = shutil.which("darktable-cli") or _find_dt_cli_windows()
+VACATION_PROFILE = {
+    "exposure_ev": 0.65,
+    "brightness": 6.0,
+    "contrast": 6.0,
+    "highlights": 20.0,
+    "shadows": 28.0,
+    "whites": 5.0,
+    "sigmoid_contrast": 18.0,
+    "sigmoid_skew": -8.0,
+    "vibrance": 8.0,
+    "clarity": 8.0,
+    "dehaze": 18.0,
+    "sharpness": 18.0,
+    "noise_reduction": 6.0,
+}
 
 
 def _load_or_new(image_path: str) -> tuple[Path, EditState]:
@@ -69,7 +59,7 @@ def _quick_preview(path: Path, state: EditState, max_size: int):
 
     # RAW files MUST go through Darktable.
     if path.suffix.lower() in RAW_EXTENSIONS:
-        if not DARKTABLE_CLI:
+        if not DARKTABLE:
             raise RuntimeError(
                 "Darktable CLI was not found. "
                 "RAW previews require darktable-cli; "
@@ -112,6 +102,7 @@ def _quick_preview(path: Path, state: EditState, max_size: int):
                 f"{preview_path}"
             )
 
+        _finish_darktable_render(preview_path, state, preview_path, max_dimension=max_size)
         img_bytes = preview_path.read_bytes()
 
         return Image(data=img_bytes, format="jpeg"), img_bytes
@@ -126,9 +117,218 @@ def _quick_preview(path: Path, state: EditState, max_size: int):
     return Image(data=buf.getvalue(), format="jpeg"), buf.getvalue()
 
 
+def _darktable_finish_state(state: EditState) -> EditState:
+    """Return the adjustment state still needed after Darktable renders RAW."""
+    finishing = replace(state)
+    finishing.adjustments = replace(
+        state.adjustments,
+        exposure_ev=0.0,
+        black_level=0.0,
+        temperature_kelvin=None,
+        tint=0.0,
+        brightness=0.0,
+        contrast=0.0,
+        highlights=0.0,
+        shadows=0.0,
+        whites=0.0,
+        blacks=0.0,
+        sigmoid_contrast=0.0,
+        sigmoid_skew=0.0,
+        saturation=0.0,
+        vibrance=0.0,
+        sharpness=0.0,
+        noise_reduction=0.0,
+        vignette=0.0,
+        clarity=0.0,
+        dehaze=0.0,
+    )
+    if _crop_is_native_darktable_safe(finishing):
+        finishing.crop = None
+    return finishing
+
+
+def _crop_is_native_darktable_safe(state: EditState) -> bool:
+    return (
+        state.crop is not None
+        and abs(state.crop.rotation) <= 0.01
+        and not state.local_adjustments
+    )
+
+
+def _needs_mcp_finishing(state: EditState) -> bool:
+    adj = state.adjustments
+    return (
+        bool(state.local_adjustments)
+        or bool(state.crop and not _crop_is_native_darktable_safe(state))
+    )
+
+
+def _save_image(img: PILImage.Image, output_path: Path, format_name: str, quality: int) -> None:
+    normalized = format_name.lower()
+    if normalized in ("jpeg", "jpg"):
+        img.save(output_path, format="JPEG", quality=quality, optimize=True)
+    elif normalized == "png":
+        img.save(output_path, format="PNG", optimize=True)
+    elif normalized in ("tiff", "tif"):
+        img.save(output_path, format="TIFF")
+    else:
+        img.save(output_path, format="JPEG", quality=quality, optimize=True)
+
+
+def _finish_darktable_render(
+    rendered_path: Path,
+    state: EditState,
+    output_path: Path,
+    *,
+    format_name: str = "jpeg",
+    quality: int = 92,
+    max_dimension: Optional[int] = None,
+) -> None:
+    """Apply MCP-side finishing after a Darktable RAW render."""
+    with PILImage.open(rendered_path) as src_img:
+        img = src_img.convert("RGB")
+
+    finishing_state = _darktable_finish_state(state)
+    proc = ImageProcessor(rendered_path)
+    img = proc._apply_post_raw(img, finishing_state.adjustments)
+    img = proc._apply_local_adjustments(img, finishing_state.local_adjustments)
+    if finishing_state.crop:
+        img = proc._apply_crop(img, finishing_state.crop)
+    if max_dimension:
+        img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
+    _save_image(img, output_path, format_name, quality)
+
+
+def _luminance_metrics(image_path: Path) -> dict:
+    import numpy as np
+
+    with PILImage.open(image_path) as img:
+        arr = np.array(img.convert("RGB"), dtype=np.float32)
+    lum = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    return {
+        "mean": round(float(lum.mean()), 2),
+        "p05": round(float(np.percentile(lum, 5)), 2),
+        "p50": round(float(np.percentile(lum, 50)), 2),
+        "p95": round(float(np.percentile(lum, 95)), 2),
+        "shadow_clip_pct": round(float((lum <= 5).mean() * 100), 3),
+        "highlight_clip_pct": round(float((lum >= 250).mean() * 100), 3),
+        "contrast_span": round(float(np.percentile(lum, 95) - np.percentile(lum, 5)), 2),
+    }
+
+
+def _apply_vacation_feedback(state: EditState, metrics: dict) -> list[str]:
+    """Adjust the vacation profile from measured preview luminance."""
+    adj = state.adjustments
+    changes: list[str] = []
+
+    if metrics["mean"] < 108 or metrics["p50"] < 92:
+        old = adj.exposure_ev
+        adj.exposure_ev = min(adj.exposure_ev + 0.3, 1.45)
+        if adj.exposure_ev != old:
+            changes.append("raised exposure")
+
+        old = adj.shadows
+        adj.shadows = min(adj.shadows + 12.0, 70.0)
+        if adj.shadows != old:
+            changes.append("lifted shadows")
+
+        old = adj.brightness
+        adj.brightness = min(adj.brightness + 3.0, 20.0)
+        if adj.brightness != old:
+            changes.append("raised brightness")
+
+    if metrics["p05"] < 18 and metrics["shadow_clip_pct"] > 0.05:
+        old = adj.shadows
+        adj.shadows = min(adj.shadows + 8.0, 75.0)
+        if adj.shadows != old:
+            changes.append("opened deep shadows")
+
+    if metrics["p95"] > 235 or metrics["highlight_clip_pct"] > 0.5:
+        old = adj.highlights
+        adj.highlights = min(adj.highlights + 12.0, 65.0)
+        if adj.highlights != old:
+            changes.append("protected highlights")
+    elif metrics["p95"] < 198:
+        old = adj.whites
+        adj.whites = min(adj.whites + 5.0, 25.0)
+        if adj.whites != old:
+            changes.append("raised whites")
+
+    if metrics["contrast_span"] < 125 and metrics["highlight_clip_pct"] < 0.75:
+        old = adj.dehaze
+        adj.dehaze = min(adj.dehaze + 8.0, 42.0)
+        if adj.dehaze != old:
+            changes.append("added dehaze")
+
+        old = adj.clarity
+        adj.clarity = min(adj.clarity + 4.0, 28.0)
+        if adj.clarity != old:
+            changes.append("added local contrast")
+
+    return changes
+
+
+def _render_feedback_preview(path: Path, state: EditState, output_path: Path, max_dimension: int = 900) -> dict:
+    if path.suffix.lower() not in RAW_EXTENSIONS:
+        proc = ImageProcessor(path)
+        img = proc.process(state, preview_size=max_dimension)
+        _save_image(img, output_path, "jpeg", 85)
+        return {"status": "ok", "rendered_via": "pillow"}
+
+    if not DARKTABLE:
+        return {"status": "error", "error": "darktable-cli is not available"}
+
+    xmp_path = write_xmp(state)
+    darktable_out = output_path.with_name(output_path.stem + "__darktable.jpg")
+    result = _export_via_darktable_cli(
+        src=path,
+        dst=darktable_out,
+        xmp=xmp_path,
+        quality=85,
+        max_dimension=max_dimension,
+    )
+    if result.get("status") == "ok":
+        _finish_darktable_render(
+            darktable_out,
+            state,
+            output_path,
+            format_name="jpeg",
+            quality=85,
+            max_dimension=max_dimension,
+        )
+    return result
+
+
+def _auto_tune_vacation_photo(path: Path, state: EditState, iterations: int = 3) -> list[dict]:
+    history: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="darktable-mcp-feedback-") as tmp:
+        tmp_path = Path(tmp)
+        for index in range(iterations):
+            preview_path = tmp_path / f"vacation-feedback-{index}.jpg"
+            result = _render_feedback_preview(path, state, preview_path)
+            if result.get("status") != "ok":
+                history.append({
+                    "iteration": index + 1,
+                    "status": "error",
+                    "error": result.get("error", "preview render failed"),
+                })
+                break
+
+            metrics = _luminance_metrics(preview_path)
+            changes = _apply_vacation_feedback(state, metrics)
+            history.append({
+                "iteration": index + 1,
+                "status": "ok",
+                "metrics": metrics,
+                "changes": changes,
+            })
+            if not changes:
+                break
+    return history
+
+
 def _save_and_open_preview(path: Path, img_bytes: bytes) -> str:
     """Save preview to disk next to the source file and open it."""
-    import os
     preview_path = path.with_name(path.stem + "__preview.jpg")
     preview_path.write_bytes(img_bytes)
     try:
@@ -187,8 +387,54 @@ def get_image_info(image_path: str) -> dict:
     proc = ImageProcessor(path)
     info = proc.get_info()
     info["edits"] = state.to_dict()
-    info["darktable_cli_available"] = DARKTABLE_CLI is not None
+    info["darktable_cli_available"] = DARKTABLE is not None
+    info["darktable_cli_path"] = str(DARKTABLE.executable) if DARKTABLE else None
     return info
+
+
+@mcp.tool()
+def get_darktable_status() -> dict:
+    """Return Darktable CLI discovery and MCP-sidecar support details."""
+    return {
+        "darktable_cli_available": DARKTABLE is not None,
+        "darktable_cli_path": str(DARKTABLE.executable) if DARKTABLE else None,
+        "adobe_dng_converter_available": DARKTABLE.dng_converter is not None if DARKTABLE else False,
+        "adobe_dng_converter_path": str(DARKTABLE.dng_converter.executable) if DARKTABLE and DARKTABLE.dng_converter else None,
+        "dng_conversion_mode": "auto; override with DARKTABLE_MCP_DNG_CONVERSION=auto|always|never",
+        "raw_rendering": "darktable-cli" if DARKTABLE else "unavailable",
+        "vacation_profile_feedback": "render-measure-adjust loop",
+        "mask_support": ["linear_gradient"],
+        "xmp_supported_adjustments": [
+            "exposure_ev",
+            "black_level",
+            "temperature_kelvin",
+            "tint",
+            "brightness",
+            "contrast",
+            "highlights",
+            "shadows",
+            "whites",
+            "blacks",
+            "saturation",
+            "vibrance",
+            "sigmoid_contrast",
+            "sigmoid_skew",
+            "dehaze",
+            "crop_without_rotation",
+            "sharpness",
+            "noise_reduction",
+            "clarity",
+            "vignette",
+        ],
+        "mcp_finishing_adjustments": [
+            "rotated_crop",
+            "linear_gradient_masks",
+        ],
+        "xmp_not_yet_mapped": [
+            "darktable-native masks",
+            "darktable-native crop rotation",
+        ],
+    }
 
 
 @mcp.tool()
@@ -244,6 +490,8 @@ def apply_adjustments(
     shadows: Optional[float] = None,
     whites: Optional[float] = None,
     blacks: Optional[float] = None,
+    sigmoid_contrast: Optional[float] = None,
+    sigmoid_skew: Optional[float] = None,
     # Colour
     saturation: Optional[float] = None,
     vibrance: Optional[float] = None,
@@ -253,6 +501,7 @@ def apply_adjustments(
     # Effects
     vignette: Optional[float] = None,
     clarity: Optional[float] = None,
+    dehaze: Optional[float] = None,
 ) -> dict:
     """Apply one or more non-destructive adjustments to an image.
 
@@ -290,6 +539,10 @@ def apply_adjustments(
         White-point adjustment (-100 to +100).
     blacks : float
         Black-point adjustment (-100 to +100).
+    sigmoid_contrast : float
+        Sigmoid-style tone curve contrast (-100 to +100).
+    sigmoid_skew : float
+        Sigmoid-style tone curve midpoint skew (-100 to +100).
     saturation : float
         Global colour saturation (-100 to +100).  0 = original.
     vibrance : float
@@ -302,6 +555,8 @@ def apply_adjustments(
         Vignette: negative values darken edges, positive lighten (-100 to +100).
     clarity : float
         Local contrast / clarity (-100 to +100).
+    dehaze : float
+        Haze reduction and mid-detail contrast (0 to 100).
     """
     try:
         path, state = _load_or_new(image_path)
@@ -321,12 +576,15 @@ def apply_adjustments(
         "shadows": shadows,
         "whites": whites,
         "blacks": blacks,
+        "sigmoid_contrast": sigmoid_contrast,
+        "sigmoid_skew": sigmoid_skew,
         "saturation": saturation,
         "vibrance": vibrance,
         "sharpness": sharpness,
         "noise_reduction": noise_reduction,
         "vignette": vignette,
         "clarity": clarity,
+        "dehaze": dehaze,
     }.items() if v is not None}
 
     state.update(params)
@@ -443,6 +701,91 @@ def reset_crop(image_path: str) -> dict:
 
 
 @mcp.tool()
+def add_gradient_mask(
+    image_path: str,
+    name: str,
+    start_x: float = 0.5,
+    start_y: float = 0.0,
+    end_x: float = 0.5,
+    end_y: float = 1.0,
+    invert: bool = False,
+    opacity: float = 1.0,
+    exposure_ev: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    sigmoid_contrast: float = 0.0,
+    sigmoid_skew: float = 0.0,
+    saturation: float = 0.0,
+    vibrance: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+) -> dict:
+    """Add or replace a reusable linear-gradient local adjustment mask.
+
+    Coordinates are normalized image positions from 0.0 to 1.0. The adjustment
+    is strongest at the end point, fades toward the start point, and can be
+    inverted for sky-style top-down masks.
+    """
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    if not name.strip():
+        return {"error": "Mask name cannot be empty."}
+    if not 0.0 <= opacity <= 1.0:
+        return {"error": "opacity must be between 0.0 and 1.0."}
+
+    local = LocalAdjustmentState(
+        name=name.strip(),
+        start_x=float(start_x),
+        start_y=float(start_y),
+        end_x=float(end_x),
+        end_y=float(end_y),
+        invert=bool(invert),
+        opacity=float(opacity),
+        exposure_ev=float(exposure_ev),
+        brightness=float(brightness),
+        contrast=float(contrast),
+        highlights=float(highlights),
+        shadows=float(shadows),
+        whites=float(whites),
+        blacks=float(blacks),
+        sigmoid_contrast=float(sigmoid_contrast),
+        sigmoid_skew=float(sigmoid_skew),
+        saturation=float(saturation),
+        vibrance=float(vibrance),
+        clarity=float(clarity),
+        dehaze=float(dehaze),
+    )
+    state.local_adjustments = [
+        item for item in state.local_adjustments
+        if item.name.lower() != local.name.lower()
+    ]
+    state.local_adjustments.append(local)
+    state.save()
+    return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def reset_masks(image_path: str) -> dict:
+    """Remove all MCP-side local adjustment masks from an image."""
+    try:
+        _path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    removed = len(state.local_adjustments)
+    state.local_adjustments = []
+    state.save()
+    return {"status": "ok", "removed": removed}
+
+
+@mcp.tool()
 def rename_output(image_path: str, new_name: str) -> dict:
     """Set the output filename stem (without extension) for the exported image.
 
@@ -474,6 +817,91 @@ def reset_edits(image_path: str) -> dict:
         sidecar.unlink()
 
     return {"status": "ok", "message": "All edits reset to original."}
+
+
+@mcp.tool()
+def edit_vacation_photo(
+    image_path: str,
+    output_directory: Optional[str] = None,
+    quality: int = 92,
+    max_dimension: Optional[int] = None,
+) -> dict:
+    """Auto-tune the vacation-photo profile and export a 16:9 JPEG.
+
+    The tool starts with a restrained summer-light profile, renders preview
+    passes, measures luminance, adjusts exposure/shadows/highlights, and then
+    exports the final image with a centered 16:9 crop.
+    """
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    state.update(VACATION_PROFILE)
+    state.crop = CropState(left=0.0, top=0.125, right=1.0, bottom=0.875)
+    state.local_adjustments = [
+        LocalAdjustmentState(
+            name="sky_protection",
+            start_x=0.5,
+            start_y=0.02,
+            end_x=0.5,
+            end_y=0.52,
+            invert=True,
+            opacity=0.55,
+            exposure_ev=-0.25,
+            highlights=28.0,
+            sigmoid_contrast=12.0,
+            saturation=4.0,
+            clarity=8.0,
+            dehaze=6.0,
+        ),
+        LocalAdjustmentState(
+            name="mountain_dehaze",
+            start_x=0.5,
+            start_y=0.18,
+            end_x=0.5,
+            end_y=0.72,
+            opacity=0.38,
+            contrast=8.0,
+            sigmoid_contrast=12.0,
+            clarity=18.0,
+            dehaze=32.0,
+        ),
+        LocalAdjustmentState(
+            name="foreground_lift",
+            start_x=0.5,
+            start_y=0.45,
+            end_x=0.5,
+            end_y=1.0,
+            opacity=0.45,
+            exposure_ev=0.18,
+            shadows=18.0,
+            contrast=4.0,
+            clarity=10.0,
+            dehaze=8.0,
+        ),
+    ]
+    if not state.output_name:
+        state.output_name = f"{path.stem}_vacation"
+    state.save()
+
+    feedback_history = _auto_tune_vacation_photo(path, state)
+    state.save()
+
+    result = export_image(
+        image_path=str(path),
+        output_directory=output_directory,
+        format="jpeg",
+        quality=quality,
+        use_darktable_cli=True,
+        write_xmp_sidecar=True,
+        max_dimension=max_dimension,
+    )
+    result["profile"] = "vacation"
+    result["feedback_history"] = feedback_history
+    result["applied"] = list(VACATION_PROFILE.keys()) + ["adaptive_feedback", "crop_16_9"]
+    result["edits"] = state.to_dict()
+    return result
 
 
 @mcp.tool()
@@ -549,25 +977,46 @@ def export_image(
                 ),
             }
 
-        if not DARKTABLE_CLI:
+        if not DARKTABLE:
             return {
                 "status": "error",
                 "error": (
                     "darktable-cli was not found. "
                     "RAW export cannot continue without Darktable."
                 ),
-            }
+        }
 
-        result = _export_via_darktable_cli(
-            src=path,
-            dst=out_path,
-            xmp=xmp_path,
-            quality=quality,
-            max_dimension=max_dimension,
-        )
+        darktable_out = out_path
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-render-") as tmp:
+            finishing_needed = _needs_mcp_finishing(state)
+            if finishing_needed:
+                darktable_out = Path(tmp) / out_path.name
+
+            result = _export_via_darktable_cli(
+                src=path,
+                dst=darktable_out,
+                xmp=xmp_path,
+                quality=quality,
+                max_dimension=max_dimension,
+            )
+
+            if result.get("status") == "ok" and darktable_out != out_path:
+                _finish_darktable_render(
+                    darktable_out,
+                    state,
+                    out_path,
+                    format_name=format,
+                    quality=quality,
+                    max_dimension=max_dimension,
+                )
 
         if result.get("status") == "ok":
-            result["xmp_sidecar"] = str(xmp_path) if xmp_path else None
+            result.update({
+                "output_path": str(out_path),
+                "size_bytes": out_path.stat().st_size,
+                "xmp_sidecar": str(xmp_path) if xmp_path else None,
+                "mcp_finishing_applied": finishing_needed,
+            })
             return result
 
         return {
@@ -627,100 +1076,13 @@ def _export_via_darktable_cli(
     to darktable-cli. This avoids backslash escaping/path parsing problems.
     """
 
-    if not DARKTABLE_CLI:
+    if not DARKTABLE:
         return {
             "status": "error",
             "error": "darktable-cli is not available",
         }
 
-    src = Path(src).resolve()
-    dst = Path(dst).resolve()
-
-    width = str(max_dimension) if max_dimension else "0"
-    height = str(max_dimension) if max_dimension else "0"
-
-    # IMPORTANT:
-    # Use forward slashes for Windows paths passed to darktable-cli.
-    darktable_exe = Path(DARKTABLE_CLI).resolve().as_posix()
-
-    src_arg = src.as_posix()
-    dst_arg = dst.as_posix()
-    
-    cmd = [
-        darktable_exe,
-        src_arg,
-    ]
-
-    if xmp:
-        xmp_arg = Path(xmp).resolve().as_posix()
-        cmd.append(xmp_arg)
-
-    cmd.extend([
-        dst_arg,
-        "--width",
-        width,
-        "--height",
-        height,
-        "--hq",
-        "true",
-        "--core",
-        "--conf",
-        f"plugins/imageio/format/jpeg/quality={quality}",
-    ])
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "error": "darktable-cli timed out after 180 seconds.",
-            "command": cmd,
-        }
-
-    except OSError as exc:
-        return {
-            "status": "error",
-            "error": f"Could not start darktable-cli: {exc}",
-            "command": cmd,
-        }
-
-    if result.returncode != 0:
-        return {
-            "status": "error",
-            "error": "darktable-cli failed.",
-            "returncode": result.returncode,
-            "stdout": result.stdout[-3000:],
-            "stderr": result.stderr[-3000:],
-            "command": cmd,
-        }
-
-    if not dst.exists():
-        return {
-            "status": "error",
-            "error": (
-                "darktable-cli returned success but did not create "
-                f"the expected output file: {dst}"
-            ),
-            "stdout": result.stdout[-3000:],
-            "stderr": result.stderr[-3000:],
-            "command": cmd,
-        }
-
-    return {
-        "status": "ok",
-        "output_path": str(dst),
-        "rendered_via": "darktable-cli",
-        "size_bytes": dst.stat().st_size,
-        "stdout": result.stdout[-1000:],
-        "stderr": result.stderr[-1000:],
-    }
+    return DARKTABLE.export(src, dst, xmp, quality=quality, max_dimension=max_dimension)
 
 
 @mcp.tool()
