@@ -50,28 +50,19 @@ def _quick_preview(path: Path, state: EditState, max_size: int):
                 "rawpy is intentionally not used for RAW previews."
             )
 
-        # Create/update the Darktable XMP from the current MCP edit state.
-        xmp_path = write_xmp(state)
-
         # Use a predictable local cache directory instead of %TEMP%.
         preview_dir = path.parent / ".darktable-mcp-preview"
         preview_dir.mkdir(parents=True, exist_ok=True)
-
         preview_path = preview_dir / f"{path.stem}__preview.jpg"
 
-        # Delete an old preview so we know the output was freshly rendered.
-        if preview_path.exists():
-            try:
-                preview_path.unlink()
-            except OSError:
-                pass
-
-        result = _export_via_darktable_cli(
-            src=path,
-            dst=preview_path,
-            xmp=xmp_path,
+        result = _export_state_to_path(
+            path=path,
+            state=state,
+            out_path=preview_path,
+            format_name="jpeg",
             quality=85,
             max_dimension=max_size,
+            overwrite=True,
         )
 
         if result.get("status") != "ok":
@@ -86,7 +77,6 @@ def _quick_preview(path: Path, state: EditState, max_size: int):
                 f"{preview_path}"
             )
 
-        _finish_darktable_render(preview_path, state, preview_path, max_dimension=max_size)
         img_bytes = preview_path.read_bytes()
 
         return Image(data=img_bytes, format="jpeg"), img_bytes
@@ -159,6 +149,15 @@ def _save_image(img: PILImage.Image, output_path: Path, format_name: str, qualit
         img.save(output_path, format="JPEG", quality=quality, optimize=True)
 
 
+def _unlink_if_exists(path: Path) -> None:
+    """Remove a known render target before Darktable writes to it."""
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def _finish_darktable_render(
     rendered_path: Path,
     state: EditState,
@@ -183,16 +182,144 @@ def _finish_darktable_render(
     _save_image(img, output_path, format_name, quality)
 
 
+def _export_state_to_path(
+    *,
+    path: Path,
+    state: EditState,
+    out_path: Path,
+    format_name: str = "jpeg",
+    quality: int = 92,
+    use_darktable_cli: bool = True,
+    write_xmp_sidecar: bool = True,
+    max_dimension: Optional[int] = None,
+    overwrite: bool = False,
+    allow_dng_conversion: bool = True,
+    config_directory: Optional[Path] = None,
+) -> dict:
+    """Render the current edit state to an exact destination path.
+
+    This is the single source of truth for preview, histogram, analysis, and
+    final export rendering.  Internal previews pass ``overwrite=True`` so stale
+    fixed-name previews cannot be mistaken for a fresh render.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        _unlink_if_exists(out_path)
+
+    xmp_path = None
+    xmp_error = None
+    if write_xmp_sidecar:
+        try:
+            xmp_path = write_xmp(state)
+        except Exception as exc:
+            xmp_error = str(exc)
+
+    if path.suffix.lower() in RAW_EXTENSIONS:
+        if write_xmp_sidecar and xmp_path is None:
+            return {
+                "status": "error",
+                "error": (
+                    "Could not write the Darktable XMP sidecar for this RAW render. "
+                    "Refusing to call darktable-cli without an explicit XMP because "
+                    "that can render stale or unedited history."
+                ),
+                "xmp_error": xmp_error,
+            }
+
+        if not use_darktable_cli:
+            return {
+                "status": "error",
+                "error": (
+                    "RAW export requires darktable-cli for this workflow. "
+                    "The rawpy fallback is disabled to keep preview and "
+                    "final rendering consistent."
+                ),
+                "xmp_sidecar": str(xmp_path) if xmp_path else None,
+            }
+
+        if not DARKTABLE:
+            return {
+                "status": "error",
+                "error": (
+                    "darktable-cli was not found. "
+                    "RAW export cannot continue without Darktable."
+                ),
+                "xmp_sidecar": str(xmp_path) if xmp_path else None,
+            }
+
+        finishing_needed = _needs_mcp_finishing(state)
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-render-") as tmp:
+            darktable_out = Path(tmp) / out_path.name if finishing_needed else out_path
+            if overwrite:
+                _unlink_if_exists(darktable_out)
+
+            result = _export_via_darktable_cli(
+                src=path,
+                dst=darktable_out,
+                xmp=xmp_path,
+                quality=quality,
+                max_dimension=max_dimension,
+                allow_dng_conversion=allow_dng_conversion,
+                config_directory=config_directory,
+            )
+
+            if result.get("status") == "ok" and darktable_out != out_path:
+                _finish_darktable_render(
+                    darktable_out,
+                    state,
+                    out_path,
+                    format_name=format_name,
+                    quality=quality,
+                    max_dimension=max_dimension,
+                )
+
+        if result.get("status") == "ok":
+            result.update({
+                "output_path": str(out_path),
+                "size_bytes": out_path.stat().st_size,
+                "xmp_sidecar": str(xmp_path) if xmp_path else None,
+                "mcp_finishing_applied": finishing_needed,
+            })
+            return result
+
+        return {
+            "status": "error",
+            "error": "Darktable RAW export failed.",
+            "details": result,
+            "xmp_sidecar": str(xmp_path) if xmp_path else None,
+        }
+
+    proc = ImageProcessor(path)
+    img = proc.process(state)
+    if max_dimension:
+        img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
+    _save_image(img, out_path, format_name, quality)
+
+    return {
+        "status": "ok",
+        "output_path": str(out_path),
+        "format": format_name,
+        "size_bytes": out_path.stat().st_size,
+        "xmp_sidecar": str(xmp_path) if xmp_path else None,
+        "rendered_via": "pillow",
+        "mcp_finishing_applied": False,
+    }
+
+
 def _image_metrics(image_path: Path) -> dict:
     import numpy as np
 
     with PILImage.open(image_path) as img:
+        width, height = img.size
         arr = np.array(img.convert("RGB"), dtype=np.float32)
     lum = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
     mx = arr.max(axis=2)
     mn = arr.min(axis=2)
     saturation = (mx - mn) / np.maximum(mx, 1.0)
     return {
+        "width": width,
+        "height": height,
+        "aspect_ratio": round(float(width / height), 4) if height else None,
         "mean": round(float(lum.mean()), 2),
         "p05": round(float(np.percentile(lum, 5)), 2),
         "p50": round(float(np.percentile(lum, 50)), 2),
@@ -206,6 +333,48 @@ def _image_metrics(image_path: Path) -> dict:
 
 def _luminance_metrics(image_path: Path) -> dict:
     return _image_metrics(image_path)
+
+
+def _metric_delta(current: dict, baseline: dict) -> dict:
+    keys = ["mean", "p05", "p50", "p95", "saturation_mean", "contrast_span"]
+    return {
+        key: round(float(current[key] - baseline[key]), 3)
+        for key in keys
+        if key in current and key in baseline
+    }
+
+
+def _diagnostic_warnings(current: dict, baseline: Optional[dict] = None, state: Optional[EditState] = None) -> list[str]:
+    warnings: list[str] = []
+    if baseline:
+        delta = _metric_delta(current, baseline)
+        if delta.get("mean", 0.0) < -5.0:
+            warnings.append(
+                "Current render is darker than the unedited Darktable render; "
+                "increase exposure/brightness/shadows unless that was intentional."
+            )
+        if delta.get("p95", 0.0) < -10.0:
+            warnings.append(
+                "Bright tones are lower than the unedited render; sunny daylight edits "
+                "usually need a higher p95/whites value while avoiding harsh clipping."
+            )
+        if delta.get("contrast_span", 0.0) < -10.0:
+            warnings.append(
+                "Current render is flatter than the unedited render; add contrast, "
+                "sigmoid contrast, clarity, or local contrast if a crisp result is wanted."
+            )
+    if state:
+        if state.crop is None:
+            warnings.append(
+                "No crop is currently set. If the intended output is 16:9, call crop_image "
+                "or apply_edit_recipe with crop top/bottom before export."
+            )
+        if not state.local_adjustments:
+            warnings.append(
+                "No local adjustments are currently set. If sky, mountains, water, or foreground "
+                "need separate treatment, add local masks/adjustments before export."
+            )
+    return warnings
 
 
 def _render_preview_to_file(
@@ -224,36 +393,18 @@ def _render_preview_to_file(
             sharpness=0.0,
             noise_reduction=0.0,
         )
-    if path.suffix.lower() not in RAW_EXTENSIONS:
-        proc = ImageProcessor(path)
-        img = proc.process(preview_state, preview_size=max_dimension)
-        _save_image(img, output_path, "jpeg", 85)
-        return {"status": "ok", "rendered_via": "pillow"}
 
-    if not DARKTABLE:
-        return {"status": "error", "error": "darktable-cli is not available"}
-
-    xmp_path = write_xmp(preview_state)
-    darktable_out = output_path.with_name(output_path.stem + "__darktable.jpg")
-    result = _export_via_darktable_cli(
-        src=render_source or path,
-        dst=darktable_out,
-        xmp=xmp_path,
+    return _export_state_to_path(
+        path=path,
+        state=preview_state,
+        out_path=output_path,
+        format_name="jpeg",
         quality=85,
         max_dimension=max_dimension,
+        overwrite=True,
         allow_dng_conversion=render_source is None,
         config_directory=config_directory,
     )
-    if result.get("status") == "ok":
-        _finish_darktable_render(
-            darktable_out,
-            preview_state,
-            output_path,
-            format_name="jpeg",
-            quality=85,
-            max_dimension=max_dimension,
-        )
-    return result
 
 
 def _render_current_edits_to_file(
@@ -457,12 +608,19 @@ def get_image_preview(image_path: str, max_size: int = 1200) -> list:
 
 
 @mcp.tool()
-def render_and_analyze(image_path: str, max_size: int = 1200, fast: bool = False) -> list:
+def render_and_analyze(
+    image_path: str,
+    max_size: int = 1200,
+    fast: bool = False,
+    compare_to_original: bool = True,
+) -> list:
     """Render current edits and return both the preview image and analysis metrics.
 
     This is the main bridge tool for an external editor loop: Claude should
     apply edits, call this tool, inspect the returned image/metrics, then decide
-    the next edit pass itself.
+    the next edit pass itself. By default this also renders an unedited baseline
+    preview first and returns objective deltas so the client can notice when an
+    edit accidentally gets darker/flatter than the original conversion.
     """
     try:
         path, state = _load_or_new(image_path)
@@ -472,6 +630,22 @@ def render_and_analyze(image_path: str, max_size: int = 1200, fast: bool = False
     preview_dir = path.parent / ".darktable-mcp-preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview_path = preview_dir / f"{path.stem}__analysis.jpg"
+
+    baseline_metrics = None
+    baseline_result = None
+    if compare_to_original:
+        baseline_path = preview_dir / f"{path.stem}__analysis_original.jpg"
+        baseline_state = EditState(source_path=path)
+        baseline_result, _baseline_bytes = _render_current_edits_to_file(
+            path,
+            baseline_state,
+            baseline_path,
+            max_size,
+            fast=fast,
+        )
+        if baseline_result.get("status") == "ok":
+            baseline_metrics = _image_metrics(baseline_path)
+
     result, img_bytes = _render_current_edits_to_file(path, state, preview_path, max_size, fast=fast)
     if result.get("status") != "ok":
         return [result]
@@ -484,6 +658,10 @@ def render_and_analyze(image_path: str, max_size: int = 1200, fast: bool = False
         "fast": fast,
         "edits": state.to_dict(),
         "render": result,
+        "baseline": baseline_metrics,
+        "baseline_render": baseline_result,
+        "delta_from_original": _metric_delta(analysis, baseline_metrics) if baseline_metrics else None,
+        "diagnostic_warnings": _diagnostic_warnings(analysis, baseline_metrics, state),
     })
     return [analysis, Image(data=img_bytes, format="jpeg")]
 
@@ -991,109 +1169,21 @@ def export_image(
         out_path = out_dir / f"{stem}_{counter}{ext}"
         counter += 1
 
-    # Optionally write Darktable XMP sidecar
-    xmp_path = None
-    if write_xmp_sidecar:
-        try:
-            xmp_path = write_xmp(state)
-        except Exception as exc:
-            xmp_path = None  # non-fatal
-
-        # RAW files: use Darktable exclusively.
-    if path.suffix.lower() in RAW_EXTENSIONS:
-        if not use_darktable_cli:
-            return {
-                "status": "error",
-                "error": (
-                    "RAW export requires darktable-cli for this workflow. "
-                    "The rawpy fallback is disabled to keep preview and "
-                    "final rendering consistent."
-                ),
-            }
-
-        if not DARKTABLE:
-            return {
-                "status": "error",
-                "error": (
-                    "darktable-cli was not found. "
-                    "RAW export cannot continue without Darktable."
-                ),
-        }
-
-        darktable_out = out_path
-        with tempfile.TemporaryDirectory(prefix="darktable-mcp-render-") as tmp:
-            finishing_needed = _needs_mcp_finishing(state)
-            if finishing_needed:
-                darktable_out = Path(tmp) / out_path.name
-
-            result = _export_via_darktable_cli(
-                src=path,
-                dst=darktable_out,
-                xmp=xmp_path,
-                quality=quality,
-                max_dimension=max_dimension,
-            )
-
-            if result.get("status") == "ok" and darktable_out != out_path:
-                _finish_darktable_render(
-                    darktable_out,
-                    state,
-                    out_path,
-                    format_name=format,
-                    quality=quality,
-                    max_dimension=max_dimension,
-                )
-
-        if result.get("status") == "ok":
-            result.update({
-                "output_path": str(out_path),
-                "size_bytes": out_path.stat().st_size,
-                "xmp_sidecar": str(xmp_path) if xmp_path else None,
-                "mcp_finishing_applied": finishing_needed,
-            })
-            return result
-
-        return {
-            "status": "error",
-            "error": "Darktable RAW export failed.",
-            "details": result,
-            "xmp_sidecar": str(xmp_path) if xmp_path else None,
-        }
-
-    # Non-RAW files continue with the Pillow path.
-    proc = ImageProcessor(path)
-    img = proc.process(state)
-
-    if max_dimension:
-        img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
-
-    save_kwargs: dict = {}
-    if format.lower() in ("jpeg", "jpg"):
-        save_kwargs = {
-            "format": "JPEG",
-            "quality": quality,
-            "optimize": True,
-        }
-    elif format.lower() == "png":
-        save_kwargs = {
-            "format": "PNG",
-            "optimize": True,
-        }
-    elif format.lower() in ("tiff", "tif"):
-        save_kwargs = {
-            "format": "TIFF"
-        }
-
-    img.save(out_path, **save_kwargs)
-
-    return {
-        "status": "ok",
-        "output_path": str(out_path),
-        "format": format,
-        "size_bytes": out_path.stat().st_size,
-        "xmp_sidecar": str(xmp_path) if xmp_path else None,
-        "rendered_via": "pillow",
-    }
+    result = _export_state_to_path(
+        path=path,
+        state=state,
+        out_path=out_path,
+        format_name=format,
+        quality=quality,
+        use_darktable_cli=use_darktable_cli,
+        write_xmp_sidecar=write_xmp_sidecar,
+        max_dimension=max_dimension,
+    )
+    if result.get("status") == "ok" and out_path.exists():
+        metrics = _image_metrics(out_path)
+        result["metrics"] = metrics
+        result["diagnostic_warnings"] = _diagnostic_warnings(metrics, state=state)
+    return result
 
 
 def _export_via_darktable_cli(
