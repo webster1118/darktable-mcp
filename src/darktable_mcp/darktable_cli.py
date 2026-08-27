@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -80,14 +81,22 @@ class DarktableCli:
         *,
         quality: int = 92,
         max_dimension: Optional[int] = None,
+        allow_dng_conversion: bool = True,
+        config_directory: Optional[Path] = None,
     ) -> dict:
         """Render one image and return a JSON-serialisable result."""
-        with tempfile.TemporaryDirectory(prefix="darktable-mcp-") as config_directory:
-            config_path = Path(config_directory)
+        config_context = (
+            nullcontext(config_directory)
+            if config_directory is not None
+            else tempfile.TemporaryDirectory(prefix="darktable-mcp-")
+        )
+        with config_context as config_context_path:
+            config_path = Path(config_context_path)
+            config_path.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="darktable-mcp-converted-dng-") as converted_directory:
                 conversion_result = None
                 render_source = source
-                should_preconvert = self._should_preconvert_dng(source)
+                should_preconvert = allow_dng_conversion and self._should_preconvert_dng(source)
                 if should_preconvert:
                     conversion_result = self._convert_dng_for_darktable(source, Path(converted_directory))
                     if conversion_result.get("status") != "ok":
@@ -102,7 +111,11 @@ class DarktableCli:
                     max_dimension=max_dimension,
                     config_directory=config_path,
                 )
-                if result.get("status") != "ok" and self._should_retry_with_converted_dng(source, should_preconvert):
+                if (
+                    allow_dng_conversion
+                    and result.get("status") != "ok"
+                    and self._should_retry_with_converted_dng(source, should_preconvert)
+                ):
                     conversion_result = self._convert_dng_for_darktable(source, Path(converted_directory))
                     if conversion_result.get("status") == "ok":
                         result = self._export_once(

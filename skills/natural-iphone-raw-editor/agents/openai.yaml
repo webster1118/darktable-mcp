@@ -1,0 +1,3 @@
+interface:
+  display_name: "Natural iPhone RAW Editor"
+  short_description: "Iteratively edit iPhone RAW/ProRAW photos through darktable-mcp"

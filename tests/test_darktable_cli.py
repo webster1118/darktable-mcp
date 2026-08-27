@@ -97,6 +97,24 @@ class DarktableCliCommandTests(unittest.TestCase):
         self.assertEqual(len(converter.calls), 1)
         self.assertNotEqual(Path(export_once.call_args.args[1]), source)
 
+    def test_export_can_reuse_supplied_config_directory(self) -> None:
+        cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-config-reuse-") as tmp:
+            source = Path(tmp) / "photo.dng"
+            destination = Path(tmp) / "out.jpg"
+            config = Path(tmp) / "shared-config"
+            source.write_bytes(b"regular dng")
+
+            def fake_export_once(_cli, render_source, destination, *args, **kwargs):
+                destination.write_bytes(b"jpg")
+                return {"status": "ok", "output_path": str(destination), "rendered_via": "darktable-cli", "size_bytes": 3}
+
+            with patch.object(DarktableCli, "_export_once", autospec=True, side_effect=fake_export_once) as export_once:
+                result = cli.export(source, destination, config_directory=config)
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(export_once.call_args.kwargs["config_directory"], config)
+
     def test_retries_failed_dng_export_with_adobe_conversion(self) -> None:
         converter = FakeDngConverter()
         cli = DarktableCli(self.tmp_path / "darktable-cli.exe", dng_converter=converter)

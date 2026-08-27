@@ -6,7 +6,12 @@ import numpy as np
 from PIL import Image
 
 from darktable_mcp.edits import CropState, EditState, LocalAdjustmentState
-from darktable_mcp.server import _apply_vacation_feedback, _finish_darktable_render, _needs_mcp_finishing
+from darktable_mcp.server import (
+    _finish_darktable_render,
+    _needs_mcp_finishing,
+    apply_edit_recipe,
+    get_current_edits,
+)
 
 
 class DarktableFinishingTests(unittest.TestCase):
@@ -48,49 +53,32 @@ class DarktableFinishingTests(unittest.TestCase):
                 arr = np.array(img)
             self.assertGreater(arr[..., 0].mean(), 130)
 
-    def test_vacation_feedback_brightens_dark_preview_metrics(self) -> None:
-        state = EditState(source_path=Path("photo.dng"))
-        state.adjustments.exposure_ev = 0.65
-        state.adjustments.shadows = 28.0
-        state.adjustments.brightness = 6.0
+    def test_apply_edit_recipe_sets_generic_adjustments_and_crop(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-recipe-test-") as tmp:
+            image = Path(tmp) / "photo.dng"
+            image.write_bytes(b"placeholder")
 
-        changes = _apply_vacation_feedback(
-            state,
-            {
-                "mean": 82.0,
-                "p05": 6.0,
-                "p50": 70.0,
-                "p95": 190.0,
-                "shadow_clip_pct": 0.2,
-                "highlight_clip_pct": 0.0,
-                "contrast_span": 184.0,
-            },
-        )
+            result = apply_edit_recipe(
+                str(image),
+                adjustments={"exposure_ev": 0.7, "saturation": 12.0, "clarity": 8.0},
+                crop={"top": 0.125, "bottom": 0.875},
+                output_name="sunny-natural",
+            )
 
-        self.assertIn("raised exposure", changes)
-        self.assertIn("lifted shadows", changes)
-        self.assertGreater(state.adjustments.exposure_ev, 0.65)
-        self.assertGreater(state.adjustments.shadows, 28.0)
+            current = get_current_edits(str(image))
 
-    def test_vacation_feedback_adds_dehaze_to_flat_preview_metrics(self) -> None:
-        state = EditState(source_path=Path("photo.dng"))
-        state.adjustments.dehaze = 18.0
-        state.adjustments.clarity = 8.0
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(current["edits"]["adjustments"]["exposure_ev"], 0.7)
+        self.assertEqual(current["edits"]["adjustments"]["saturation"], 12.0)
+        self.assertEqual(current["edits"]["crop"]["top"], 0.125)
+        self.assertEqual(current["edits"]["output_name"], "sunny-natural")
 
-        changes = _apply_vacation_feedback(
-            state,
-            {
-                "mean": 122.0,
-                "p05": 62.0,
-                "p50": 124.0,
-                "p95": 170.0,
-                "shadow_clip_pct": 0.0,
-                "highlight_clip_pct": 0.0,
-                "contrast_span": 108.0,
-            },
-        )
+    def test_apply_edit_recipe_rejects_unknown_adjustments(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-recipe-test-") as tmp:
+            image = Path(tmp) / "photo.dng"
+            image.write_bytes(b"placeholder")
 
-        self.assertIn("added dehaze", changes)
-        self.assertIn("added local contrast", changes)
-        self.assertGreater(state.adjustments.dehaze, 18.0)
-        self.assertGreater(state.adjustments.clarity, 8.0)
+            result = apply_edit_recipe(str(image), adjustments={"magic": 1.0})
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Unknown adjustment", result["error"])

@@ -4,7 +4,7 @@
   <img src="icon.png" alt="DarktableMCP Logo" width="160"/>
 </p>
 
-> Developed by [Yadullah Abidi (YaddyVirus)](https://github.com/YaddyVirus)
+> Maintained by [webster1118](https://github.com/webster1118). Forked from the original DarktableMCP project by [Yadullah Abidi (YaddyVirus)](https://github.com/YaddyVirus).
 
 A Model Context Protocol (MCP) server that lets you edit photos using Claude as your AI photo editor. Works with **Claude Desktop** and **Claude Code**.
 
@@ -49,7 +49,7 @@ Use `always` or `never` to force or disable this preprocessing.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yadullahabidi/darktable-mcp.git
+git clone https://github.com/webster1118/darktable-mcp.git
 cd darktable-mcp
 ```
 
@@ -137,11 +137,11 @@ Crop it to 16:9 and export as JPEG at maximum quality, name it "jodhpur_desert".
 
 Claude will:
 1. Call `list_images` to see your folder
-2. Call `get_image_preview` to analyse the photo
-3. Call `apply_adjustments` with specific values
-4. Show you a preview (saved as `filename__preview.jpg` next to the source)
-5. Iterate based on your feedback
-6. Export the final image when you're happy
+2. Call `render_and_analyze` to see the current Darktable render and metrics
+3. Call `apply_edit_recipe` or `apply_adjustments` with specific values
+4. Render/analyze again and decide whether the edit matched your description
+5. Iterate until the image matches the requested look
+6. Export the final image at full size when you're happy
 
 ### Available tools
 
@@ -151,7 +151,11 @@ Claude will:
 | `get_image_info` | EXIF metadata + current edit state |
 | `get_darktable_status` | Show Darktable CLI discovery and supported v2 edit routing |
 | `get_image_preview` | Render and preview with edits applied |
+| `render_and_analyze` | Render current edits and return a preview plus tone/color metrics |
+| `compare_to_reference` | Compare current render metrics to a reference JPEG |
 | `apply_adjustments` | Exposure, WB, tone, colour, detail, dehaze, effects |
+| `apply_edit_recipe` | Apply a generic dict of adjustments, crop, output name, and mask clearing |
+| `convert_dng_if_needed` | Explicitly run Adobe DNG Converter for ProRAW/diagnostics |
 | `crop_image` | Crop by coordinates or aspect ratio |
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
@@ -159,7 +163,6 @@ Claude will:
 | `reset_masks` | Remove all local masks |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF |
-| `edit_vacation_photo` | Apply the restrained vacation-photo profile and export a 16:9 JPEG |
 | `reset_edits` | Undo everything, back to original |
 | `get_histogram` | Tonal/clipping analysis |
 | `copy_settings` | Copy edits from one image to another |
@@ -172,6 +175,17 @@ Claude will:
 - *"Straighten the horizon by about 1.5 degrees"*
 - *"Export all photos in this folder with the same settings"*
 - *"Reset everything and start fresh"*
+
+For subjective edits, describe the desired look and ask Claude to iterate using
+the bridge tools instead of calling a hardcoded preset. For example:
+
+```text
+Edit this iPhone RAW so it feels like bright sunny daylight as I remember the
+scene: professional, natural, clear sky and water, detailed mountains, not HDR
+and not oversaturated. Use render_and_analyze after each edit pass. Prefer
+native Darktable/XMP adjustments. Do not use local masks unless I ask for them.
+Export full size when the preview is good.
+```
 
 ---
 
@@ -205,9 +219,11 @@ The preview is always saved as `originalname__preview.jpg` next to your source f
 
 ---
 
-## Author
+## Maintainer
 
-**Yadullah Abidi** — [@YaddyVirus](https://github.com/YaddyVirus)
+**webster1118** — [@webster1118](https://github.com/webster1118)
+
+Original project by **Yadullah Abidi** — [@YaddyVirus](https://github.com/YaddyVirus)
 
 ## License
 
