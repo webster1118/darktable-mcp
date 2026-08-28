@@ -48,6 +48,16 @@ class DarktableCliCommandTests(unittest.TestCase):
 
         self.assertIn("plugins/imageio/format/jpeg/quality=100", command)
 
+    def test_can_build_fast_non_hq_preview_command(self) -> None:
+        cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
+        command = cli.build_export_command(
+            self.tmp_path / "photo.DNG",
+            self.tmp_path / "result.jpg",
+            high_quality=False,
+        )
+
+        self.assertEqual(command[command.index("--hq") + 1], "false")
+
     def test_uses_a_supplied_isolated_darktable_config(self) -> None:
         cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
         config = self.tmp_path / "darktable-config"
@@ -120,6 +130,54 @@ class DarktableCliCommandTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok", result)
         self.assertEqual(export_once.call_args.kwargs["config_directory"], config)
+
+    def test_export_uses_reusable_default_config_directory(self) -> None:
+        cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-config-default-") as tmp:
+            source = Path(tmp) / "photo.dng"
+            destination = Path(tmp) / "out.jpg"
+            configured = Path(tmp) / "mcp-darktable-config"
+            source.write_bytes(b"regular dng")
+
+            def fake_export_once(_cli, render_source, destination, *args, **kwargs):
+                destination.write_bytes(b"jpg")
+                return {"status": "ok", "output_path": str(destination), "rendered_via": "darktable-cli", "size_bytes": 3}
+
+            with patch.dict(os.environ, {"DARKTABLE_MCP_CONFIGDIR": str(configured)}):
+                with patch.object(DarktableCli, "_export_once", autospec=True, side_effect=fake_export_once) as export_once:
+                    result = cli.export(source, destination)
+                    config_exists = configured.exists()
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(export_once.call_args.kwargs["config_directory"], configured)
+        self.assertTrue(config_exists)
+
+    def test_dng_conversion_reuses_persistent_cache(self) -> None:
+        converter = FakeDngConverter()
+        cli = DarktableCli(self.tmp_path / "darktable-cli.exe", dng_converter=converter)
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-convert-cache-") as tmp:
+            source = Path(tmp) / "photo.dng"
+            first_destination = Path(tmp) / "first.jpg"
+            second_destination = Path(tmp) / "second.jpg"
+            source.write_bytes(b"regular dng")
+            render_sources: list[Path] = []
+
+            def fake_export_once(_cli, render_source, destination, *args, **kwargs):
+                render_sources.append(Path(render_source))
+                destination.write_bytes(b"jpg")
+                return {"status": "ok", "output_path": str(destination), "rendered_via": "darktable-cli", "size_bytes": 3}
+
+            with patch.dict(os.environ, {"DARKTABLE_MCP_DNG_CONVERSION": "always", "DARKTABLE_MCP_DNG_CACHE": "1"}):
+                with patch.object(DarktableCli, "_export_once", autospec=True, side_effect=fake_export_once):
+                    first = cli.export(source, first_destination)
+                    second = cli.export(source, second_destination)
+
+        self.assertEqual(first["status"], "ok", first)
+        self.assertEqual(second["status"], "ok", second)
+        self.assertEqual(len(converter.calls), 1)
+        self.assertFalse(first["dng_conversion"]["cache_hit"])
+        self.assertTrue(second["dng_conversion"]["cache_hit"])
+        self.assertEqual(render_sources[0], render_sources[1])
 
     def test_retries_failed_dng_export_with_adobe_conversion(self) -> None:
         converter = FakeDngConverter()

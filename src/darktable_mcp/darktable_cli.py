@@ -18,6 +18,13 @@ from typing import Optional, Sequence
 from .dng_converter import AdobeDngConverter, is_probably_apple_proraw
 
 
+def _truthy_env(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "never"}
+
+
 def find_darktable_cli() -> Optional[Path]:
     """Return the configured Darktable CLI executable, if it is installed."""
     configured = os.environ.get("DARKTABLE_CLI")
@@ -52,6 +59,7 @@ class DarktableCli:
         quality: int = 100,
         max_dimension: Optional[int] = None,
         config_directory: Optional[Path] = None,
+        high_quality: bool = True,
     ) -> list[str]:
         """Build the documented darktable-cli invocation for one export."""
         if not 1 <= quality <= 100:
@@ -66,7 +74,7 @@ class DarktableCli:
         if xmp:
             command.append(xmp.resolve().as_posix())
         command.extend([destination.as_posix(), "--width", str(max_dimension or 0),
-                        "--height", str(max_dimension or 0), "--hq", "true"])
+                        "--height", str(max_dimension or 0), "--hq", "true" if high_quality else "false"])
         if config_directory:
             command.extend(["--core", "--configdir", config_directory.resolve().as_posix()])
         if destination.suffix.lower() in {".jpg", ".jpeg"}:
@@ -83,12 +91,13 @@ class DarktableCli:
         max_dimension: Optional[int] = None,
         allow_dng_conversion: bool = True,
         config_directory: Optional[Path] = None,
+        high_quality: bool = True,
     ) -> dict:
         """Render one image and return a JSON-serialisable result."""
         config_context = (
             nullcontext(config_directory)
             if config_directory is not None
-            else tempfile.TemporaryDirectory(prefix="darktable-mcp-")
+            else nullcontext(self._default_config_directory())
         )
         with config_context as config_context_path:
             config_path = Path(config_context_path)
@@ -98,7 +107,7 @@ class DarktableCli:
                 render_source = source
                 should_preconvert = allow_dng_conversion and self._should_preconvert_dng(source)
                 if should_preconvert:
-                    conversion_result = self._convert_dng_for_darktable(source, Path(converted_directory))
+                    conversion_result = self._cached_or_convert_dng(source, Path(converted_directory))
                     if conversion_result.get("status") != "ok":
                         return conversion_result
                     render_source = Path(conversion_result["output_path"])
@@ -110,13 +119,14 @@ class DarktableCli:
                     quality=quality,
                     max_dimension=max_dimension,
                     config_directory=config_path,
+                    high_quality=high_quality,
                 )
                 if (
                     allow_dng_conversion
                     and result.get("status") != "ok"
                     and self._should_retry_with_converted_dng(source, should_preconvert)
                 ):
-                    conversion_result = self._convert_dng_for_darktable(source, Path(converted_directory))
+                    conversion_result = self._cached_or_convert_dng(source, Path(converted_directory))
                     if conversion_result.get("status") == "ok":
                         result = self._export_once(
                             Path(conversion_result["output_path"]),
@@ -125,6 +135,7 @@ class DarktableCli:
                             quality=quality,
                             max_dimension=max_dimension,
                             config_directory=config_path,
+                            high_quality=high_quality,
                         )
                         result["darktable_first_attempt"] = "failed"
 
@@ -133,7 +144,8 @@ class DarktableCli:
                         "status": "ok",
                         "converted_via": conversion_result.get("converted_via"),
                         "source_path": str(source),
-                        "intermediate_storage": "temporary",
+                        "intermediate_storage": conversion_result.get("intermediate_storage", "temporary"),
+                        "cache_hit": conversion_result.get("cache_hit", False),
                     }
                 return result
 
@@ -146,10 +158,11 @@ class DarktableCli:
         quality: int,
         max_dimension: Optional[int],
         config_directory: Path,
+        high_quality: bool,
     ) -> dict:
         command = self.build_export_command(
             source, destination, xmp, quality=quality, max_dimension=max_dimension,
-            config_directory=config_directory,
+            config_directory=config_directory, high_quality=high_quality,
         )
         try:
             completed = subprocess.run(
@@ -172,6 +185,12 @@ class DarktableCli:
     def _conversion_mode(self) -> str:
         mode = os.environ.get("DARKTABLE_MCP_DNG_CONVERSION", "auto").strip().lower()
         return mode if mode in {"auto", "always", "never"} else "auto"
+
+    def _default_config_directory(self) -> Path:
+        configured = os.environ.get("DARKTABLE_MCP_CONFIGDIR")
+        if configured:
+            return Path(configured)
+        return Path(tempfile.gettempdir()) / "darktable-mcp-darktable-config"
 
     def _should_preconvert_dng(self, source: Path) -> bool:
         if source.suffix.lower() != ".dng" or not self.dng_converter:
@@ -198,3 +217,35 @@ class DarktableCli:
                 "error": "Adobe DNG Converter is not available for DNG preprocessing.",
             }
         return self.dng_converter.convert(source, output_directory)
+
+    def _cached_or_convert_dng(self, source: Path, temporary_directory: Path) -> dict:
+        if not _truthy_env("DARKTABLE_MCP_DNG_CACHE", True):
+            result = self._convert_dng_for_darktable(source, temporary_directory)
+            if result.get("status") == "ok":
+                result["intermediate_storage"] = "temporary"
+                result["cache_hit"] = False
+            return result
+
+        cache_directory = source.parent / ".darktable-mcp-converted"
+        cached_path = cache_directory / source.name
+        try:
+            if (
+                cached_path.exists()
+                and cached_path.stat().st_mtime >= source.stat().st_mtime
+                and cached_path.stat().st_size > 0
+            ):
+                return {
+                    "status": "ok",
+                    "output_path": str(cached_path),
+                    "converted_via": "adobe-dng-converter-cache",
+                    "intermediate_storage": "persistent_cache",
+                    "cache_hit": True,
+                }
+        except OSError:
+            pass
+
+        result = self._convert_dng_for_darktable(source, cache_directory)
+        if result.get("status") == "ok":
+            result["intermediate_storage"] = "persistent_cache"
+            result["cache_hit"] = False
+        return result

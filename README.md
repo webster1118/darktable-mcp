@@ -31,16 +31,19 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 
 The server discovers `darktable-cli` automatically, including the standard
 per-user Windows installation. If yours is elsewhere, set `DARKTABLE_CLI` to
-the full path of `darktable-cli.exe`. Each render uses an isolated temporary
-Darktable configuration, so it can run while the Darktable desktop application
-is open without competing for its catalog lock.
+the full path of `darktable-cli.exe`. Renders use a reusable MCP Darktable
+configuration/cache directory by default for better feedback-loop performance.
+Set `DARKTABLE_MCP_CONFIGDIR` if you want to choose that directory explicitly.
 
 Apple ProRAW DNGs can be converted before rendering with Adobe DNG Converter.
 The server discovers the normal Windows install path automatically; set
 `ADOBE_DNG_CONVERTER` if it is installed elsewhere. Conversion defaults to
 `DARKTABLE_MCP_DNG_CONVERSION=auto`: likely Apple ProRAW DNGs are converted
 up front, and other DNGs are retried through Adobe if Darktable rejects them.
-Use `always` or `never` to force or disable this preprocessing.
+Use `always` or `never` to force or disable this preprocessing. Converted DNGs
+are cached in `.darktable-mcp-converted` by default so repeated preview/final
+render passes do not reconvert the same ProRAW file. Set
+`DARKTABLE_MCP_DNG_CACHE=0` to disable this cache.
 
 ---
 
@@ -138,11 +141,11 @@ Crop it to 16:9 and export as JPEG at quality 100, name it "jodhpur_desert".
 Claude will:
 1. Call `list_images` to see your folder
 2. Call `get_image_info` and apply a recommended ProRAW starting point when needed
-3. Call `render_and_analyze` to see the current Darktable render and metrics
+3. Call `render_and_analyze(fast=true, compare_to_original=false)` for normal preview iterations
 4. Call `apply_edit_recipe` or `apply_adjustments` with specific values
-5. Render/analyze again and decide whether the edit matched your description
+5. Render/analyze again cheaply and decide whether the edit matched your description
 6. Iterate until the image matches the requested look
-7. Export the final image at full size when you're happy
+7. Run a non-fast checkpoint render, then export the final image at full size when you're happy
 
 ### Available tools
 
@@ -153,7 +156,7 @@ Claude will:
 | `get_darktable_status` | Show Darktable CLI discovery and supported v2 edit routing |
 | `apply_starting_point` | Apply a neutral ProRAW/RAW normalization starting point |
 | `get_image_preview` | Render and preview with edits applied |
-| `render_and_analyze` | Render current edits and return a preview plus tone/color metrics |
+| `render_and_analyze` | Render current edits and return a preview plus tone/color metrics; use `fast=true` for most feedback loops |
 | `compare_to_reference` | Compare current render metrics to a reference JPEG |
 | `apply_adjustments` | Exposure, WB, tone, colour, detail, dehaze, effects |
 | `apply_edit_recipe` | Apply a generic dict of adjustments, crop, output name, and mask clearing |
@@ -161,7 +164,12 @@ Claude will:
 | `crop_image` | Crop by coordinates or aspect ratio |
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
-| `add_gradient_mask` | Add or replace a reusable local gradient adjustment |
+| `add_gradient_mask` | Add or replace a reusable local gradient adjustment; written as a native Darktable drawn gradient mask when possible |
+| `add_ellipse_mask` | Add a native Darktable ellipse drawn-mask adjustment |
+| `add_path_mask` | Add a native Darktable path drawn-mask adjustment from polygon-like points |
+| `add_brush_mask` | Add a native Darktable brush drawn-mask adjustment from stroke points |
+| `add_parametric_mask` | Add a native Darktable parametric mask by channel/range |
+| `add_ai_object_mask` | Reports why sidecar-only CLI cannot safely create Darktable AI/object masks |
 | `reset_masks` | Remove all local masks |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF |
@@ -192,11 +200,29 @@ Lightroom habit of sharpening 70 and sharpening masking 70, then compare to the
 reference/detail metrics. Export full size at quality 100 when the preview is good.
 ```
 
+For faster iteration, ask Claude to use `render_and_analyze(fast=true,
+compare_to_original=false)` for normal edit passes, then one non-fast checkpoint
+render before judging sharpness/detail or exporting. For batches, edit one
+representative image deeply, copy/apply the recipe to similar images, quick-check
+only the outliers, and then perform final full-size exports at `quality=100`.
+
+Linear-gradient, ellipse, path, brush, and parametric local adjustments are
+written as native Darktable masks when the requested local controls map to
+native modules. Mask coordinates are still supplied in the visible cropped
+preview frame; the XMP writer translates safe drawn masks back into Darktable's
+source-image coordinate system. Fine crop rotation is written natively through
+Darktable's rotate-and-perspective module. Combining fine rotation with local
+drawn masks still falls back to MCP finishing to avoid misplaced masks. AI/object
+masks are not generated from sidecar-only CLI because Darktable's object mask
+pipeline depends on live segmentation/model state.
+
 For Apple ProRAW files, `get_image_info` and `get_current_edits` can recommend
 the `apple_proraw_natural` starting point. This is a neutral first-pass
 normalization for Darktable's dark/flat ProRAW render, not a finished style.
 Final export removes MCP-generated preview/analysis files by default; use
-`cleanup_temporary_files` if you want to clean them manually.
+`cleanup_temporary_files` if you want to clean them manually. Pass
+`include_converted=true` only when you also want to remove the cached converted
+DNG for that source image.
 
 ---
 
@@ -207,11 +233,13 @@ Each image gets a companion `.mcp.json` sidecar file (e.g. `IMG_3500.mcp.json`) 
 On RAW/DNG export, Darktable handles the RAW render through `darktable-cli`.
 The MCP writes a Darktable-compatible `.xmp` sidecar for verified Darktable 5.6
 module payloads including exposure, white balance/temperature, basic tone,
-color balance RGB, sigmoid, haze removal, simple crop, sharpen, sharpening
-masking, and vignette.
+color balance RGB, sigmoid, haze removal, simple crop, native straighten
+rotation, sharpen, sharpening masking, and vignette.
 Shadows/whites/blacks use tone equalizer, denoise uses profiled denoise, and
-clarity uses local contrast. Local masks and rotated crops still use the MCP
-finishing pass until their native Darktable payloads are verified.
+clarity uses local contrast. Linear-gradient, ellipse, path, brush, and
+parametric masks are written as native Darktable masks for supported local
+adjustments. AI/object masks are not generated from sidecar-only CLI because
+Darktable's segmentation pipeline depends on live GUI/model state.
 
 ---
 

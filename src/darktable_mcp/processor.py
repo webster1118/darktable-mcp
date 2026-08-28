@@ -255,10 +255,10 @@ class ImageProcessor:
             img = self._process_raster(edit_state.adjustments)
 
         img = self._apply_post_raw(img, edit_state.adjustments)
-        img = self._apply_local_adjustments(img, edit_state.local_adjustments)
-
         if edit_state.crop:
             img = self._apply_crop(img, edit_state.crop)
+
+        img = self._apply_local_adjustments(img, edit_state.local_adjustments)
 
         if preview_size:
             img.thumbnail((preview_size, preview_size), Image.LANCZOS)

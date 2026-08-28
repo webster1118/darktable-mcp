@@ -23,9 +23,11 @@ Pillow finishing pass until their Darktable 5.6 module payloads are verified.
 """
 from __future__ import annotations
 
+import math
 import struct
+from html import escape
 from pathlib import Path
-from .edits import EditState, CropState
+from .edits import CropState, EditState, LocalAdjustmentState
 
 # ---------------------------------------------------------------------------
 # Blendop default (7 bytes + padding, version 7)
@@ -60,6 +62,80 @@ def _blendop() -> str:
     # opacity = 1.0
     struct.pack_into("<f", buf, 8, 1.0)
     return buf.hex()
+
+
+def _masked_blendop(mask_id: int, opacity: float = 1.0, invert: bool = False) -> str:
+    """Legacy blendop version 7 with a drawn-mask reference.
+
+    Darktable 5.6 upgrades v7 blend params internally.  The v7 layout is small
+    and stable enough for the MCP writer: mask mode, blend mode, opacity,
+    combine mode, mask id, blendif, blur radius, reserved fields, then the
+    neutral blendif curve values.
+    """
+    buf = bytearray(300)
+    # DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+    struct.pack_into("<I", buf, 0, 3)
+    # DEVELOP_BLEND_NORMAL2 in modern Darktable; accepted as legacy normal.
+    struct.pack_into("<I", buf, 4, 0x18)
+    # Darktable's blend opacity is stored as a percentage.
+    struct.pack_into("<f", buf, 8, max(0.0, min(1.0, opacity)) * 100.0)
+    # DEVELOP_COMBINE_NORM_EXCL or DEVELOP_COMBINE_INV_EXCL
+    struct.pack_into("<I", buf, 12, 1 if invert else 0)
+    struct.pack_into("<I", buf, 16, mask_id)
+    struct.pack_into("<I", buf, 20, 0)
+    struct.pack_into("<f", buf, 24, 0.0)
+    offset = 44
+    for _ in range(16):
+        struct.pack_into("<ffff", buf, offset, 0.0, 0.0, 1.0, 1.0)
+        offset += 16
+    return buf.hex()
+
+
+def _parametric_blendop(
+    local: LocalAdjustmentState,
+    opacity: float = 1.0,
+    *,
+    mask_id: int = 0,
+) -> str:
+    """Legacy blendop version 7 with a Darktable parametric mask."""
+    buf = bytearray.fromhex(_masked_blendop(mask_id, opacity, local.invert))
+    mask_mode = 1 | 4
+    if mask_id:
+        mask_mode |= 2
+    struct.pack_into("<I", buf, 0, mask_mode)
+    channel = _parametric_channel_index(local.parametric_channel)
+    struct.pack_into("<I", buf, 20, 1 << channel)
+    offset = 44 + channel * 16
+    low = max(0.0, min(1.0, local.parametric_low))
+    low_soft = max(0.0, min(1.0, local.parametric_low_soft))
+    high_soft = max(0.0, min(1.0, local.parametric_high_soft))
+    high = max(0.0, min(1.0, local.parametric_high))
+    values = sorted([low, low_soft, high_soft, high])
+    struct.pack_into("<ffff", buf, offset, *values)
+    return buf.hex()
+
+
+def _parametric_channel_index(channel: str) -> int:
+    normalized = channel.strip().lower().replace("-", "_")
+    channels = {
+        "luminance": 0,
+        "gray": 0,
+        "grey": 0,
+        "red": 1,
+        "green": 2,
+        "blue": 3,
+        "output_luminance": 4,
+        "output_gray": 4,
+        "output_grey": 4,
+        "output_red": 5,
+        "output_green": 6,
+        "output_blue": 7,
+        "hue": 8,
+        "saturation_channel": 9,
+        "chroma": 9,
+        "lightness": 10,
+    }
+    return channels.get(normalized, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +292,33 @@ def _encode_crop(crop: CropState) -> str:
         ratio_d,
     )
     return data.hex()
+
+
+def _encode_ashift_rotation(rotation: float) -> str:
+    """rotate and perspective (ashift) module version 5 for native straightening."""
+    clamped_rotation = max(-180.0, min(180.0, rotation))
+    last_drawn_lines = [0.0] * (50 * 4)
+    last_quad_lines = [0.0] * 8
+    return struct.pack(
+        "<ffffffffii" + "ffff" + "f" * len(last_drawn_lines) + "i" + "f" * len(last_quad_lines),
+        clamped_rotation,
+        0.0,   # lensshift_v
+        0.0,   # lensshift_h
+        0.0,   # shear
+        28.0,  # f_length
+        1.0,   # crop_factor
+        100.0, # orthocorr
+        1.0,   # aspect
+        0,     # ASHIFT_MODE_GENERIC
+        0,     # ASHIFT_CROP_OFF
+        0.0,   # cl
+        1.0,   # cr
+        0.0,   # ct
+        1.0,   # cb
+        *last_drawn_lines,
+        0,
+        *last_quad_lines,
+    ).hex()
 
 
 def _crop_ratio(crop: CropState) -> tuple[int, int]:
@@ -414,12 +517,241 @@ def _encode_bilat(clarity: float) -> str:
     ).hex()
 
 
-def _crop_is_native_safe(edit_state: EditState) -> bool:
-    return (
-        edit_state.crop is not None
-        and abs(edit_state.crop.rotation) <= 0.01
-        and not edit_state.local_adjustments
+def _local_native_supported(local: LocalAdjustmentState) -> bool:
+    return local.mask_type in {"linear_gradient", "ellipse", "path", "brush", "parametric"} and local.enabled and local.has_changes()
+
+
+def local_adjustments_are_native_safe(edit_state: EditState) -> bool:
+    """Return True when local adjustments can be represented as Darktable masks."""
+    if not edit_state.local_adjustments:
+        return True
+    if edit_state.crop and abs(edit_state.crop.rotation) > 0.01:
+        # Darktable drawn-mask coordinates live in source-image space.  Rotated
+        # MCP crop finishing changes that space, so keep that path in MCP.
+        return False
+    return all(
+        (not item.enabled or not item.has_changes() or _local_native_supported(item))
+        for item in edit_state.local_adjustments
     )
+
+
+def _crop_is_native_safe(edit_state: EditState) -> bool:
+    return edit_state.crop is not None and local_adjustments_are_native_safe(edit_state)
+
+
+def _masked_source_points(local: LocalAdjustmentState, crop: CropState | None) -> tuple[float, float, float, float]:
+    """Convert MCP visible-frame mask points to Darktable source-frame points."""
+    if crop:
+        width = crop.right - crop.left
+        height = crop.bottom - crop.top
+        start_x = crop.left + local.start_x * width
+        start_y = crop.top + local.start_y * height
+        end_x = crop.left + local.end_x * width
+        end_y = crop.top + local.end_y * height
+    else:
+        start_x, start_y = local.start_x, local.start_y
+        end_x, end_y = local.end_x, local.end_y
+    return (
+        max(0.0, min(1.0, start_x)),
+        max(0.0, min(1.0, start_y)),
+        max(0.0, min(1.0, end_x)),
+        max(0.0, min(1.0, end_y)),
+    )
+
+
+def _source_point(x: float, y: float, crop: CropState | None) -> tuple[float, float]:
+    if crop:
+        x = crop.left + x * (crop.right - crop.left)
+        y = crop.top + y * (crop.bottom - crop.top)
+    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+
+def _encode_gradient_mask_points(local: LocalAdjustmentState, crop: CropState | None) -> str:
+    start_x, start_y, end_x, end_y = _masked_source_points(local, crop)
+    low_x, low_y, high_x, high_y = (
+        (end_x, end_y, start_x, start_y) if local.invert
+        else (start_x, start_y, end_x, end_y)
+    )
+    dx = high_x - low_x
+    dy = high_y - low_y
+    length = math.hypot(dx, dy)
+    anchor_x = (start_x + end_x) / 2.0
+    anchor_y = (start_y + end_y) / 2.0
+    if length < 0.0001:
+        rotation = 0.0
+        compression = 0.12
+    else:
+        ux = dx / length
+        uy = dy / length
+        # Darktable rotation 0 means the high-opacity side points upward.
+        rotation = -math.degrees(math.atan2(ux, -uy))
+        compression = max(0.02, min(0.5, length / math.sqrt(2.0) / 2.0))
+    # dt_masks_point_gradient_t: anchor[2], rotation, compression,
+    # steepness, curvature, state.  Use linear state for predictable ramps.
+    return struct.pack(
+        "<ffffffi",
+        anchor_x,
+        anchor_y,
+        rotation,
+        compression,
+        0.0,
+        0.0,
+        1,
+    ).hex()
+
+
+def _encode_ellipse_mask_points(local: LocalAdjustmentState, crop: CropState | None) -> str:
+    center_x, center_y = _source_point(local.center_x, local.center_y, crop)
+    scale_x = crop.right - crop.left if crop else 1.0
+    scale_y = crop.bottom - crop.top if crop else 1.0
+    radius_x = max(0.001, min(1.0, local.radius_x * scale_x))
+    radius_y = max(0.001, min(1.0, local.radius_y * scale_y))
+    border = max(0.0, min(0.5, local.feather * max(scale_x, scale_y)))
+    return struct.pack(
+        "<ffffffi",
+        center_x,
+        center_y,
+        radius_x,
+        radius_y,
+        local.rotation,
+        border,
+        1,  # proportional radii
+    ).hex()
+
+
+def _normalised_points(points: list[list[float]], crop: CropState | None) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for point in points:
+        if len(point) < 2:
+            continue
+        out.append(_source_point(float(point[0]), float(point[1]), crop))
+    return out
+
+
+def _encode_path_mask_points(local: LocalAdjustmentState, crop: CropState | None) -> str:
+    points = _normalised_points(local.path_points, crop)
+    if len(points) < 3:
+        cx, cy = _source_point(local.center_x, local.center_y, crop)
+        rx = max(0.001, local.radius_x * (crop.right - crop.left if crop else 1.0))
+        ry = max(0.001, local.radius_y * (crop.bottom - crop.top if crop else 1.0))
+        points = [
+            (cx - rx, cy - ry),
+            (cx + rx, cy - ry),
+            (cx + rx, cy + ry),
+            (cx - rx, cy + ry),
+        ]
+        points = [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for x, y in points]
+    border = max(0.0, min(0.5, local.feather))
+    buf = bytearray()
+    for x, y in points:
+        buf.extend(struct.pack(
+            "<ffffffffi",
+            x,
+            y,
+            x,
+            y,
+            x,
+            y,
+            border,
+            border,
+            1,
+        ))
+    return buf.hex()
+
+
+def _encode_brush_mask_points(local: LocalAdjustmentState, crop: CropState | None) -> str:
+    points = _normalised_points(local.brush_points or local.path_points, crop)
+    if len(points) < 2:
+        sx, sy, ex, ey = _masked_source_points(local, crop)
+        points = [(sx, sy), (ex, ey)]
+    border = max(0.001, min(0.5, local.feather))
+    density = max(0.0, min(1.0, local.opacity))
+    hardness = max(0.0, min(1.0, local.hardness))
+    buf = bytearray()
+    for x, y in points:
+        buf.extend(struct.pack(
+            "<ffffffffffi",
+            x,
+            y,
+            x,
+            y,
+            x,
+            y,
+            border,
+            border,
+            density,
+            hardness,
+            1,
+        ))
+    return buf.hex()
+
+
+def _mask_type_code(local: LocalAdjustmentState) -> int | None:
+    return {
+        "linear_gradient": 16,
+        "ellipse": 32,
+        "path": 2,
+        "brush": 64,
+    }.get(local.mask_type)
+
+
+def _encode_drawn_mask_points(local: LocalAdjustmentState, crop: CropState | None) -> str:
+    if local.mask_type == "linear_gradient":
+        return _encode_gradient_mask_points(local, crop)
+    if local.mask_type == "ellipse":
+        return _encode_ellipse_mask_points(local, crop)
+    if local.mask_type == "path":
+        return _encode_path_mask_points(local, crop)
+    if local.mask_type == "brush":
+        return _encode_brush_mask_points(local, crop)
+    raise ValueError(f"Unsupported drawn mask type: {local.mask_type}")
+
+
+def _mask_points_count(local: LocalAdjustmentState) -> int:
+    if local.mask_type in {"linear_gradient", "ellipse"}:
+        return 1
+    if local.mask_type == "path":
+        return max(3, len([p for p in local.path_points if len(p) >= 2]))
+    if local.mask_type == "brush":
+        return max(2, len([p for p in (local.brush_points or local.path_points) if len(p) >= 2]))
+    return 0
+
+
+def _local_adjustment_modules(local: LocalAdjustmentState) -> list[tuple[str, int, str]]:
+    modules: list[tuple[str, int, str]] = []
+    if local.exposure_ev != 0.0:
+        modules.append(("exposure", 6, _encode_exposure(local.exposure_ev, 0.0)))
+    if local.brightness != 0.0 or local.highlights != 0.0:
+        modules.append(("basicadj", 2, _encode_basicadj(local.brightness, local.highlights)))
+    if local.contrast != 0.0 or local.saturation != 0.0 or local.vibrance != 0.0:
+        modules.append((
+            "colorbalancergb",
+            5,
+            _encode_colorbalancergb(local.contrast, local.saturation, local.vibrance),
+        ))
+    if local.sigmoid_contrast != 0.0 or local.sigmoid_skew != 0.0:
+        modules.append(("sigmoid", 3, _encode_sigmoid(local.sigmoid_contrast, local.sigmoid_skew)))
+    if local.dehaze != 0.0:
+        modules.append(("hazeremoval", 3, _encode_hazeremoval(local.dehaze)))
+    if local.shadows != 0.0 or local.whites != 0.0 or local.blacks != 0.0:
+        modules.append(("toneequal", 2, _encode_toneequal(local.shadows, local.whites, local.blacks)))
+    if local.clarity != 0.0:
+        modules.append(("bilat", 3, _encode_bilat(local.clarity)))
+    return modules
+
+
+_MASK_ITEM = """\
+     <rdf:li
+      darktable:mask_num="{mask_num}"
+      darktable:mask_id="{mask_id}"
+      darktable:mask_type="{mask_type}"
+      darktable:mask_name="{mask_name}"
+      darktable:mask_version="6"
+      darktable:mask_points="{mask_points}"
+      darktable:mask_nb="{mask_nb}"
+      darktable:mask_src="0000000000000000"
+      />
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +774,10 @@ _XMP_TEMPLATE = """\
     <rdf:Seq>
 {history_items}    </rdf:Seq>
    </darktable:history>
+   <darktable:masks_history>
+    <rdf:Seq>
+{mask_items}    </rdf:Seq>
+   </darktable:masks_history>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
@@ -453,8 +789,9 @@ _HISTORY_ITEM = """\
       darktable:enabled="1"
       darktable:modversion="{modversion}"
       darktable:params="{params}"
-      darktable:multi_name=""
-      darktable:multi_priority="0"
+      darktable:multi_name="{multi_name}"
+      darktable:multi_name_hand_edited="{multi_name_hand_edited}"
+      darktable:multi_priority="{multi_priority}"
       darktable:blendop_version="7"
       darktable:blendop_params="{blendop}"
       />
@@ -466,10 +803,30 @@ def write_xmp(edit_state: EditState) -> Path:
     adj = edit_state.adjustments
     blendop = _blendop()
     items: list[str] = []
+    mask_items: list[str] = []
+    multi_priorities: dict[str, int] = {}
 
-    def _item(op: str, ver: int, params: str) -> str:
+    def _item(
+        op: str,
+        ver: int,
+        params: str,
+        *,
+        item_blendop: str = blendop,
+        multi_name: str = "",
+        multi_priority: int | None = None,
+    ) -> str:
+        priority = multi_priority
+        if priority is None:
+            priority = multi_priorities.get(op, 0)
+        multi_priorities[op] = max(multi_priorities.get(op, 0), priority + 1)
         return _HISTORY_ITEM.format(
-            operation=op, modversion=ver, params=params, blendop=blendop
+            operation=op,
+            modversion=ver,
+            params=params,
+            multi_name=escape(multi_name, quote=True),
+            multi_name_hand_edited=1 if multi_name else 0,
+            multi_priority=priority,
+            blendop=item_blendop,
         )
 
     # Exposure
@@ -506,7 +863,45 @@ def write_xmp(edit_state: EditState) -> Path:
 
     # Crop without rotation
     if _crop_is_native_safe(edit_state):
+        if abs(edit_state.crop.rotation) > 0.01:
+            items.append(_item("ashift", 5, _encode_ashift_rotation(edit_state.crop.rotation)))
         items.append(_item("crop", 3, _encode_crop(edit_state.crop)))
+
+    # Native Darktable drawn masks for local linear-gradient adjustments.
+    if local_adjustments_are_native_safe(edit_state):
+        next_mask_id = 1
+        for local in edit_state.local_adjustments:
+            if not _local_native_supported(local):
+                continue
+            if local.mask_type == "parametric":
+                masked_blendop = _parametric_blendop(local, local.opacity)
+            else:
+                mask_id = next_mask_id
+                next_mask_id += 1
+                mask_type = _mask_type_code(local)
+                if mask_type is None:
+                    continue
+                mask_items.append(_MASK_ITEM.format(
+                    mask_num=mask_id - 1,
+                    mask_id=mask_id,
+                    mask_type=mask_type,
+                    mask_name=escape(local.name, quote=True),
+                    mask_points=_encode_drawn_mask_points(local, edit_state.crop),
+                    mask_nb=_mask_points_count(local),
+                ))
+                masked_blendop = _masked_blendop(
+                    mask_id,
+                    local.opacity,
+                    local.invert and local.mask_type != "linear_gradient",
+                )
+            for op, ver, params in _local_adjustment_modules(local):
+                items.append(_item(
+                    op,
+                    ver,
+                    params,
+                    item_blendop=masked_blendop,
+                    multi_name=local.name,
+                ))
 
     # Sharpening
     if adj.sharpness > 0:
@@ -527,6 +922,7 @@ def write_xmp(edit_state: EditState) -> Path:
     xmp_content = _XMP_TEMPLATE.format(
         history_end=len(items),
         history_items="".join(items),
+        mask_items="".join(mask_items),
     )
 
     xmp_path = edit_state.source_path.with_suffix(".xmp")

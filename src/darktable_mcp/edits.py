@@ -60,6 +60,20 @@ class LocalAdjustmentState:
     start_y: float = 0.0
     end_x: float = 0.5
     end_y: float = 1.0
+    center_x: float = 0.5
+    center_y: float = 0.5
+    radius_x: float = 0.25
+    radius_y: float = 0.25
+    rotation: float = 0.0
+    feather: float = 0.05
+    hardness: float = 0.6
+    path_points: list[list[float]] = field(default_factory=list)
+    brush_points: list[list[float]] = field(default_factory=list)
+    parametric_channel: str = "luminance"
+    parametric_low: float = 0.0
+    parametric_low_soft: float = 0.0
+    parametric_high_soft: float = 1.0
+    parametric_high: float = 1.0
     invert: bool = False
     opacity: float = 1.0
     enabled: bool = True

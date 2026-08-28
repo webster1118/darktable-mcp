@@ -39,29 +39,36 @@ class DarktableFinishingTests(unittest.TestCase):
             Image.new("RGB", (1600, 1200), color=(128, 128, 128)).save(source)
             state = EditState(source_path=tmp_path / "photo.dng")
             state.crop = CropState(left=0.0, top=0.125, right=1.0, bottom=0.875, rotation=0.5)
+            state.local_adjustments.append(
+                LocalAdjustmentState(name="native_blocker", mask_type="unsupported", saturation=1.0)
+            )
 
             _finish_darktable_render(source, state, output, format_name="jpeg", quality=90)
 
             with Image.open(output) as img:
                 self.assertLess(abs(img.size[0] / img.size[1] - 16 / 9), 0.01)
 
-    def test_finishing_applies_local_adjustments_before_crop(self) -> None:
+    def test_fallback_finishing_applies_crop_before_local_adjustments(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-finish-test-") as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "render.jpg"
             output = tmp_path / "finished.jpg"
             Image.new("RGB", (200, 100), color=(80, 80, 80)).save(source)
             state = EditState(source_path=tmp_path / "photo.dng")
-            state.local_adjustments.append(
-                LocalAdjustmentState(name="bottom", start_y=0.0, end_y=1.0, exposure_ev=1.0)
-            )
             state.crop = CropState(left=0.0, top=0.5, right=1.0, bottom=1.0)
+            state.local_adjustments.append(
+                LocalAdjustmentState(name="top_after_crop", start_y=0.0, end_y=0.4, invert=True, exposure_ev=1.0)
+            )
+            state.local_adjustments.append(
+                LocalAdjustmentState(name="native_blocker", mask_type="unsupported", saturation=1.0)
+            )
 
             _finish_darktable_render(source, state, output, format_name="jpeg", quality=90)
 
             with Image.open(output) as img:
                 arr = np.array(img)
-            self.assertGreater(arr[..., 0].mean(), 130)
+            self.assertGreater(arr[0, :, 0].mean(), 130)
+            self.assertLess(arr[-1, :, 0].mean(), 100)
 
     def test_apply_edit_recipe_sets_generic_adjustments_and_crop(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-recipe-test-") as tmp:
@@ -121,6 +128,32 @@ class DarktableFinishingTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok", result)
         self.assertEqual(rendered_bytes, b"fresh preview")
+
+    def test_fast_preview_uses_non_hq_darktable_render(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-preview-fast-test-") as tmp:
+            tmp_path = Path(tmp)
+            image = tmp_path / "photo.dng"
+            output = tmp_path / "preview.jpg"
+            image.write_bytes(b"placeholder dng")
+            state = EditState(source_path=image)
+            qualities: list[bool] = []
+
+            def fake_export(src, dst, xmp, quality, max_dimension=None, **kwargs):
+                qualities.append(kwargs["high_quality"])
+                dst.write_bytes(b"fast preview")
+                return {
+                    "status": "ok",
+                    "output_path": str(dst),
+                    "rendered_via": "darktable-cli",
+                    "size_bytes": dst.stat().st_size,
+                }
+
+            with patch("darktable_mcp.server.DARKTABLE", object()):
+                with patch("darktable_mcp.server._export_via_darktable_cli", side_effect=fake_export):
+                    result = _render_preview_to_file(image, state, output, max_dimension=400, fast=True)
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(qualities, [False])
 
     def test_metric_delta_and_warnings_flag_darker_uncropped_edits(self) -> None:
         current = {

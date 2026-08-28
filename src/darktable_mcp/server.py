@@ -14,7 +14,7 @@ from .darktable_cli import DarktableCli
 from .dng_converter import is_probably_apple_proraw
 from .edits import CropState, EditState, LocalAdjustmentState
 from .processor import ALL_EXTENSIONS, RAW_EXTENSIONS, ImageProcessor
-from .xmp_writer import write_xmp
+from .xmp_writer import local_adjustments_are_native_safe, write_xmp
 
 mcp = MCPServer("DarktableMCP")
 
@@ -212,17 +212,12 @@ def _darktable_finish_state(state: EditState) -> EditState:
 
 
 def _crop_is_native_darktable_safe(state: EditState) -> bool:
-    return (
-        state.crop is not None
-        and abs(state.crop.rotation) <= 0.01
-        and not state.local_adjustments
-    )
+    return state.crop is not None and local_adjustments_are_native_safe(state)
 
 
 def _needs_mcp_finishing(state: EditState) -> bool:
-    adj = state.adjustments
     return (
-        bool(state.local_adjustments)
+        bool(state.local_adjustments and not local_adjustments_are_native_safe(state))
         or bool(state.crop and not _crop_is_native_darktable_safe(state))
     )
 
@@ -264,9 +259,9 @@ def _finish_darktable_render(
     finishing_state = _darktable_finish_state(state)
     proc = ImageProcessor(rendered_path)
     img = proc._apply_post_raw(img, finishing_state.adjustments)
-    img = proc._apply_local_adjustments(img, finishing_state.local_adjustments)
     if finishing_state.crop:
         img = proc._apply_crop(img, finishing_state.crop)
+    img = proc._apply_local_adjustments(img, finishing_state.local_adjustments)
     if max_dimension:
         img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
     _save_image(img, output_path, format_name, quality)
@@ -285,6 +280,7 @@ def _export_state_to_path(
     overwrite: bool = False,
     allow_dng_conversion: bool = True,
     config_directory: Optional[Path] = None,
+    high_quality: bool = True,
 ) -> dict:
     """Render the current edit state to an exact destination path.
 
@@ -351,6 +347,7 @@ def _export_state_to_path(
                 max_dimension=max_dimension,
                 allow_dng_conversion=allow_dng_conversion,
                 config_directory=config_directory,
+                high_quality=high_quality,
             )
 
             if result.get("status") == "ok" and darktable_out != out_path:
@@ -683,6 +680,7 @@ def _render_preview_to_file(
         overwrite=True,
         allow_dng_conversion=render_source is None,
         config_directory=config_directory,
+        high_quality=not fast,
     )
 
 
@@ -776,6 +774,24 @@ def get_darktable_status() -> dict:
         "dng_conversion_mode": "auto; override with DARKTABLE_MCP_DNG_CONVERSION=auto|always|never",
         "raw_rendering": "darktable-cli" if DARKTABLE else "unavailable",
         "workflow": "bridge only; the client/Claude should decide iterative edits",
+        "performance": {
+            "dng_conversion_cache": (
+                "enabled by default; converted Apple ProRAW files are reused from "
+                ".darktable-mcp-converted unless DARKTABLE_MCP_DNG_CACHE=0"
+            ),
+            "darktable_config_cache": (
+                "enabled by default; override with DARKTABLE_MCP_CONFIGDIR if a specific "
+                "Darktable CLI cache/config directory is wanted"
+            ),
+            "fast_preview_mode": (
+                "render_and_analyze(fast=true) uses Darktable's faster non-HQ mode and "
+                "skips sharpening/noise reduction; use fast=false for final detail checks"
+            ),
+            "baseline_comparison": (
+                "render_and_analyze compare_to_original defaults to false for speed; "
+                "enable it for first/checkpoint renders when needed"
+            ),
+        },
         "starting_points": {
             name: {
                 "description": profile["description"],
@@ -783,7 +799,14 @@ def get_darktable_status() -> dict:
             }
             for name, profile in STARTING_POINTS.items()
         },
-        "mask_support": ["linear_gradient"],
+        "mask_support": ["linear_gradient", "ellipse", "path", "brush", "parametric"],
+        "native_mask_support": [
+            "linear_gradient_drawn_masks_for_supported_local_adjustments",
+            "ellipse_drawn_masks_for_supported_local_adjustments",
+            "path_drawn_masks_for_supported_local_adjustments",
+            "brush_drawn_masks_for_supported_local_adjustments",
+            "parametric_masks_for_supported_local_adjustments",
+        ],
         "xmp_supported_adjustments": [
             "exposure_ev",
             "black_level",
@@ -801,6 +824,7 @@ def get_darktable_status() -> dict:
             "sigmoid_skew",
             "dehaze",
             "crop_without_rotation",
+            "straighten_rotation_via_ashift",
             "sharpness",
             "sharpening_masking",
             "noise_reduction",
@@ -808,12 +832,11 @@ def get_darktable_status() -> dict:
             "vignette",
         ],
         "mcp_finishing_adjustments": [
-            "rotated_crop",
-            "linear_gradient_masks",
+            "unsupported_masks",
+            "combined_crop_rotation_with_local_masks",
         ],
         "xmp_not_yet_mapped": [
-            "darktable-native masks",
-            "darktable-native crop rotation",
+            "AI/object masks",
         ],
     }
 
@@ -944,7 +967,7 @@ def render_and_analyze(
     image_path: str,
     max_size: int = 1200,
     fast: bool = False,
-    compare_to_original: bool = True,
+    compare_to_original: bool = False,
 ) -> list:
     """Render current edits and return both the preview image and analysis metrics.
 
@@ -952,7 +975,9 @@ def render_and_analyze(
     apply edits, call this tool, inspect the returned image/metrics, then decide
     the next edit pass itself. By default this also renders an unedited baseline
     preview first and returns objective deltas so the client can notice when an
-    edit accidentally gets darker/flatter than the original conversion.
+    edit accidentally gets darker/flatter than the original conversion. For
+    speed, repeated feedback loops should normally leave comparison off and
+    request it only for the first render or checkpoint renders.
     """
     try:
         path, state = _load_or_new(image_path)
@@ -1341,6 +1366,14 @@ def reset_crop(image_path: str) -> dict:
     return {"status": "ok", "message": "Crop reset to full frame."}
 
 
+def _replace_local_adjustment(state: EditState, local: LocalAdjustmentState) -> None:
+    state.local_adjustments = [
+        item for item in state.local_adjustments
+        if item.name.lower() != local.name.lower()
+    ]
+    state.local_adjustments.append(local)
+
+
 @mcp.tool()
 def add_gradient_mask(
     image_path: str,
@@ -1367,9 +1400,10 @@ def add_gradient_mask(
 ) -> dict:
     """Add or replace a reusable linear-gradient local adjustment mask.
 
-    Coordinates are normalized image positions from 0.0 to 1.0. The adjustment
-    is strongest at the end point, fades toward the start point, and can be
-    inverted for sky-style top-down masks.
+    Coordinates are normalized positions from 0.0 to 1.0 on the visible rendered
+    frame after crop/rotation finishing. The adjustment is strongest at the end
+    point, fades toward the start point, and can be inverted for sky-style
+    top-down masks.
     """
     try:
         path, state = _load_or_new(image_path)
@@ -1407,9 +1441,285 @@ def add_gradient_mask(
         item for item in state.local_adjustments
         if item.name.lower() != local.name.lower()
     ]
-    state.local_adjustments.append(local)
+    _replace_local_adjustment(state, local)
     state.save()
     return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def add_ellipse_mask(
+    image_path: str,
+    name: str,
+    center_x: float = 0.5,
+    center_y: float = 0.5,
+    radius_x: float = 0.25,
+    radius_y: float = 0.25,
+    rotation: float = 0.0,
+    feather: float = 0.05,
+    invert: bool = False,
+    opacity: float = 1.0,
+    exposure_ev: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    sigmoid_contrast: float = 0.0,
+    sigmoid_skew: float = 0.0,
+    saturation: float = 0.0,
+    vibrance: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+) -> dict:
+    """Add or replace a native Darktable ellipse drawn-mask adjustment."""
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    if not name.strip():
+        return {"error": "Mask name cannot be empty."}
+    if not 0.0 <= opacity <= 1.0:
+        return {"error": "opacity must be between 0.0 and 1.0."}
+
+    local = LocalAdjustmentState(
+        name=name.strip(),
+        mask_type="ellipse",
+        center_x=float(center_x),
+        center_y=float(center_y),
+        radius_x=float(radius_x),
+        radius_y=float(radius_y),
+        rotation=float(rotation),
+        feather=float(feather),
+        invert=bool(invert),
+        opacity=float(opacity),
+        exposure_ev=float(exposure_ev),
+        brightness=float(brightness),
+        contrast=float(contrast),
+        highlights=float(highlights),
+        shadows=float(shadows),
+        whites=float(whites),
+        blacks=float(blacks),
+        sigmoid_contrast=float(sigmoid_contrast),
+        sigmoid_skew=float(sigmoid_skew),
+        saturation=float(saturation),
+        vibrance=float(vibrance),
+        clarity=float(clarity),
+        dehaze=float(dehaze),
+    )
+    _replace_local_adjustment(state, local)
+    state.save()
+    return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def add_path_mask(
+    image_path: str,
+    name: str,
+    path_points: list[list[float]],
+    feather: float = 0.04,
+    invert: bool = False,
+    opacity: float = 1.0,
+    exposure_ev: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    sigmoid_contrast: float = 0.0,
+    sigmoid_skew: float = 0.0,
+    saturation: float = 0.0,
+    vibrance: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+) -> dict:
+    """Add or replace a native Darktable path drawn-mask adjustment.
+
+    path_points are normalized [x, y] points on the visible cropped preview.
+    """
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    if not name.strip():
+        return {"error": "Mask name cannot be empty."}
+    if len(path_points) < 3:
+        return {"error": "path_points must contain at least three [x, y] points."}
+    if not 0.0 <= opacity <= 1.0:
+        return {"error": "opacity must be between 0.0 and 1.0."}
+
+    local = LocalAdjustmentState(
+        name=name.strip(),
+        mask_type="path",
+        path_points=path_points,
+        feather=float(feather),
+        invert=bool(invert),
+        opacity=float(opacity),
+        exposure_ev=float(exposure_ev),
+        brightness=float(brightness),
+        contrast=float(contrast),
+        highlights=float(highlights),
+        shadows=float(shadows),
+        whites=float(whites),
+        blacks=float(blacks),
+        sigmoid_contrast=float(sigmoid_contrast),
+        sigmoid_skew=float(sigmoid_skew),
+        saturation=float(saturation),
+        vibrance=float(vibrance),
+        clarity=float(clarity),
+        dehaze=float(dehaze),
+    )
+    _replace_local_adjustment(state, local)
+    state.save()
+    return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def add_brush_mask(
+    image_path: str,
+    name: str,
+    brush_points: list[list[float]],
+    feather: float = 0.03,
+    hardness: float = 0.6,
+    invert: bool = False,
+    opacity: float = 1.0,
+    exposure_ev: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    sigmoid_contrast: float = 0.0,
+    sigmoid_skew: float = 0.0,
+    saturation: float = 0.0,
+    vibrance: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+) -> dict:
+    """Add or replace a native Darktable brush drawn-mask adjustment."""
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    if not name.strip():
+        return {"error": "Mask name cannot be empty."}
+    if len(brush_points) < 2:
+        return {"error": "brush_points must contain at least two [x, y] points."}
+    if not 0.0 <= opacity <= 1.0:
+        return {"error": "opacity must be between 0.0 and 1.0."}
+
+    local = LocalAdjustmentState(
+        name=name.strip(),
+        mask_type="brush",
+        brush_points=brush_points,
+        feather=float(feather),
+        hardness=float(hardness),
+        invert=bool(invert),
+        opacity=float(opacity),
+        exposure_ev=float(exposure_ev),
+        brightness=float(brightness),
+        contrast=float(contrast),
+        highlights=float(highlights),
+        shadows=float(shadows),
+        whites=float(whites),
+        blacks=float(blacks),
+        sigmoid_contrast=float(sigmoid_contrast),
+        sigmoid_skew=float(sigmoid_skew),
+        saturation=float(saturation),
+        vibrance=float(vibrance),
+        clarity=float(clarity),
+        dehaze=float(dehaze),
+    )
+    _replace_local_adjustment(state, local)
+    state.save()
+    return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def add_parametric_mask(
+    image_path: str,
+    name: str,
+    channel: str = "luminance",
+    low: float = 0.0,
+    low_soft: float = 0.0,
+    high_soft: float = 1.0,
+    high: float = 1.0,
+    invert: bool = False,
+    opacity: float = 1.0,
+    exposure_ev: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    sigmoid_contrast: float = 0.0,
+    sigmoid_skew: float = 0.0,
+    saturation: float = 0.0,
+    vibrance: float = 0.0,
+    clarity: float = 0.0,
+    dehaze: float = 0.0,
+) -> dict:
+    """Add or replace a native Darktable parametric-mask adjustment."""
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    if not name.strip():
+        return {"error": "Mask name cannot be empty."}
+    if not 0.0 <= opacity <= 1.0:
+        return {"error": "opacity must be between 0.0 and 1.0."}
+
+    local = LocalAdjustmentState(
+        name=name.strip(),
+        mask_type="parametric",
+        parametric_channel=channel,
+        parametric_low=float(low),
+        parametric_low_soft=float(low_soft),
+        parametric_high_soft=float(high_soft),
+        parametric_high=float(high),
+        invert=bool(invert),
+        opacity=float(opacity),
+        exposure_ev=float(exposure_ev),
+        brightness=float(brightness),
+        contrast=float(contrast),
+        highlights=float(highlights),
+        shadows=float(shadows),
+        whites=float(whites),
+        blacks=float(blacks),
+        sigmoid_contrast=float(sigmoid_contrast),
+        sigmoid_skew=float(sigmoid_skew),
+        saturation=float(saturation),
+        vibrance=float(vibrance),
+        clarity=float(clarity),
+        dehaze=float(dehaze),
+    )
+    _replace_local_adjustment(state, local)
+    state.save()
+    return {"status": "ok", "mask": local.__dict__, "edits": state.to_dict()}
+
+
+@mcp.tool()
+def add_ai_object_mask(image_path: str, name: str, x: float = 0.5, y: float = 0.5) -> dict:
+    """Explain why native AI/object masks cannot be generated by sidecar-only CLI."""
+    return {
+        "status": "unsupported",
+        "mask": name,
+        "image_path": image_path,
+        "requested_point": {"x": x, "y": y},
+        "reason": (
+            "Darktable object masks depend on the GUI/session AI segmentation "
+            "pipeline and model state. The MCP can write stable drawn/parametric "
+            "XMP masks, but it cannot safely synthesize a Darktable object mask "
+            "from a sidecar alone."
+        ),
+        "recommended_alternative": (
+            "Use add_path_mask, add_ellipse_mask, add_brush_mask, or "
+            "add_gradient_mask for native Darktable local adjustments."
+        ),
+    }
 
 
 @mcp.tool()
@@ -1562,6 +1872,7 @@ def _export_via_darktable_cli(
     max_dimension: Optional[int] = None,
     allow_dng_conversion: bool = True,
     config_directory: Optional[Path] = None,
+    high_quality: bool = True,
 ) -> dict:
     """
     Render/export an image using darktable-cli.
@@ -1584,6 +1895,7 @@ def _export_via_darktable_cli(
         max_dimension=max_dimension,
         allow_dng_conversion=allow_dng_conversion,
         config_directory=config_directory,
+        high_quality=high_quality,
     )
 
 
