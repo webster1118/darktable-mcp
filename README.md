@@ -205,6 +205,11 @@ compare_to_original=false)` for normal edit passes, then one non-fast checkpoint
 render before judging sharpness/detail or exporting. For batches, edit one
 representative image deeply, copy/apply the recipe to similar images, quick-check
 only the outliers, and then perform final full-size exports at `quality=100`.
+When a reference image is provided, `compare_to_reference` returns explicit
+quality gates such as weak sky blue separation, dark lake, dark foreground, or
+dark center midtones. Claude should not finalize while
+`reference_quality_gates.must_not_finalize` is true unless you explicitly accept
+the mismatch.
 
 Linear-gradient, ellipse, path, brush, and parametric local adjustments are
 written as native Darktable masks when the requested local controls map to

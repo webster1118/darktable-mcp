@@ -769,7 +769,7 @@ _XMP_TEMPLATE = """\
     darktable:xmp_version="4"
     darktable:raw_params="0"
     darktable:auto_presets_applied="1"
-    darktable:history_end="{history_end}">
+    darktable:history_end="{history_end}"{iop_order_attributes}>
    <darktable:history>
     <rdf:Seq>
 {history_items}    </rdf:Seq>
@@ -798,6 +798,61 @@ _HISTORY_ITEM = """\
 """
 
 
+_DARKTABLE_V50_RAW_IOP_ORDER = (
+    "rawprepare", "invert", "temperature", "rasterfile", "highlights",
+    "cacorrect", "hotpixels", "rawdenoise", "demosaic", "denoiseprofile",
+    "bilateral", "rotatepixels", "scalepixels", "lens", "cacorrectrgb",
+    "hazeremoval", "ashift", "flip", "enlargecanvas", "overlay",
+    "clipping", "liquify", "spots", "retouch", "exposure",
+    "mask_manager", "tonemap", "toneequal", "crop", "graduatednd",
+    "profile_gamma", "equalizer", "colorin", "channelmixerrgb",
+    "contrastntexture", "diffuse", "censorize", "negadoctor", "blurs",
+    "primaries", "nlmeans", "colorchecker", "defringe", "atrous",
+    "lowpass", "highpass", "sharpen", "colortransfer", "colormapping",
+    "channelmixer", "basicadj", "colorharmonizer", "colorbalance",
+    "colorequal", "colorbalancergb", "rgbcurve", "rgblevels",
+    "basecurve", "filmic", "sigmoid", "agx", "filmicrgb", "lut3d",
+    "colisa", "tonecurve", "levels", "shadhi", "zonesystem",
+    "globaltonemap", "relight", "bilat", "colorcorrection",
+    "colorcontrast", "velvia", "vibrance", "colorzones", "bloom",
+    "colorize", "lowlight", "monochrome", "grain", "soften",
+    "splittoning", "vignette", "colorreconstruct", "finalscale",
+    "colorout", "clahe", "overexposed", "rawoverexposed", "dither",
+    "borders", "watermark", "gamma",
+)
+
+
+def _build_iop_order(history_instances: list[tuple[str, int]]) -> tuple[int, str]:
+    """Build a Darktable 5.x RAW iop-order list including active multi-instances.
+
+    Darktable's default order contains only base module instances. When an XMP
+    history contains repeated local masked modules, Darktable maps history items
+    by operation + multi_priority; without those extra instance entries it logs
+    "cannot get iop-order" and may order local edits unpredictably.
+    """
+    extra_instances: dict[str, set[int]] = {}
+    for operation, priority in history_instances:
+        if priority > 0:
+            extra_instances.setdefault(operation, set()).add(priority)
+
+    if not extra_instances:
+        return 4, ""
+
+    pairs: list[str] = []
+    seen: set[str] = set()
+    for operation in _DARKTABLE_V50_RAW_IOP_ORDER:
+        seen.add(operation)
+        pairs.extend([operation, "0"])
+        for priority in sorted(extra_instances.get(operation, ())):
+            pairs.extend([operation, str(priority)])
+
+    for operation in sorted(set(extra_instances) - seen):
+        for priority in sorted(extra_instances[operation]):
+            pairs.extend([operation, str(priority)])
+
+    return 0, ",".join(pairs)
+
+
 def write_xmp(edit_state: EditState) -> Path:
     """Write a Darktable XMP sidecar for *edit_state* and return its path."""
     adj = edit_state.adjustments
@@ -805,6 +860,7 @@ def write_xmp(edit_state: EditState) -> Path:
     items: list[str] = []
     mask_items: list[str] = []
     multi_priorities: dict[str, int] = {}
+    history_instances: list[tuple[str, int]] = []
 
     def _item(
         op: str,
@@ -819,6 +875,7 @@ def write_xmp(edit_state: EditState) -> Path:
         if priority is None:
             priority = multi_priorities.get(op, 0)
         multi_priorities[op] = max(multi_priorities.get(op, 0), priority + 1)
+        history_instances.append((op, priority))
         return _HISTORY_ITEM.format(
             operation=op,
             modversion=ver,
@@ -919,8 +976,14 @@ def write_xmp(edit_state: EditState) -> Path:
     if adj.vignette != 0.0:
         items.append(_item("vignette", 4, _encode_vignette(adj.vignette)))
 
+    iop_order_version, iop_order_list = _build_iop_order(history_instances)
+    iop_order_attributes = f'\n    darktable:iop_order_version="{iop_order_version}"'
+    if iop_order_list:
+        iop_order_attributes += f'\n    darktable:iop_order_list="{escape(iop_order_list, quote=True)}"'
+
     xmp_content = _XMP_TEMPLATE.format(
         history_end=len(items),
+        iop_order_attributes=iop_order_attributes,
         history_items="".join(items),
         mask_items="".join(mask_items),
     )

@@ -90,6 +90,7 @@ class XmpWriterTests(unittest.TestCase):
     def test_writes_native_linear_gradient_masked_module(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-xmp-test-") as tmp:
             state = EditState(source_path=Path(tmp) / "photo.dng")
+            state.adjustments.vibrance = 2
             state.crop = CropState(top=0.125, bottom=0.875)
             state.local_adjustments.append(
                 LocalAdjustmentState(
@@ -110,6 +111,10 @@ class XmpWriterTests(unittest.TestCase):
         self.assertIn('darktable:mask_name="sky blue"', xmp)
         self.assertIn('darktable:operation="colorbalancergb"', xmp)
         self.assertIn('darktable:multi_name="sky blue"', xmp)
+        self.assertIn('darktable:iop_order_version="0"', xmp)
+        self.assertIn('darktable:iop_order_list="rawprepare,0', xmp)
+        self.assertIn('colorbalancergb,0,colorbalancergb,1', xmp)
+        self.assertTrue(xmp.index("rawprepare,0") < xmp.index("gamma,0"))
 
         mask_points_match = re.search(r'darktable:mask_points="([0-9a-f]+)"', xmp)
         self.assertIsNotNone(mask_points_match)
@@ -123,7 +128,7 @@ class XmpWriterTests(unittest.TestCase):
         self.assertEqual(state_value, 1)
 
         blend_match = re.search(
-            r'darktable:operation="colorbalancergb".*?darktable:blendop_params="([0-9a-f]+)"',
+            r'darktable:operation="colorbalancergb".*?darktable:multi_name="sky blue".*?darktable:blendop_params="([0-9a-f]+)"',
             xmp,
             re.DOTALL,
         )
@@ -143,6 +148,8 @@ class XmpWriterTests(unittest.TestCase):
     def test_writes_native_ellipse_path_brush_and_parametric_masks(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-xmp-test-") as tmp:
             state = EditState(source_path=Path(tmp) / "photo.dng")
+            state.adjustments.exposure_ev = 0.2
+            state.adjustments.brightness = 2
             state.local_adjustments.extend([
                 LocalAdjustmentState(
                     name="ellipse subject",
@@ -188,6 +195,9 @@ class XmpWriterTests(unittest.TestCase):
         self.assertIn('darktable:operation="hazeremoval"', xmp)
         self.assertIn('darktable:operation="basicadj"', xmp)
         self.assertIn('darktable:multi_name="bright tones"', xmp)
+        self.assertIn('darktable:iop_order_version="0"', xmp)
+        self.assertIn('exposure,0,exposure,1', xmp)
+        self.assertIn('basicadj,0,basicadj,1', xmp)
 
         bright_match = re.search(
             r'darktable:multi_name="bright tones".*?darktable:blendop_params="([0-9a-f]+)"',

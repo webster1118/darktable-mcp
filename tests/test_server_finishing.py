@@ -11,6 +11,7 @@ from darktable_mcp.server import (
     _cleanup_generated_files,
     _diagnostic_warnings,
     _export_state_to_path,
+    _reference_quality_gates,
     _metric_delta,
     _reference_match_suggestions,
     _regional_metric_delta,
@@ -270,6 +271,48 @@ class DarktableFinishingTests(unittest.TestCase):
         self.assertTrue(any("Lake is darker" in suggestion for suggestion in suggestions))
         self.assertTrue(any("Lake color" in suggestion for suggestion in suggestions))
         self.assertTrue(any("Mountain detail" in suggestion for suggestion in suggestions))
+
+    def test_reference_quality_gates_reject_weak_grey_sky(self) -> None:
+        delta = {
+            "mean": -2.0,
+            "p50": -3.0,
+        }
+        regional_delta = {
+            "sky_top": {
+                "colorfulness": -32.0,
+                "blue_dominance": -20.0,
+                "red_blue_gap": 30.0,
+            }
+        }
+
+        suggestions = _reference_match_suggestions(delta, regional_delta)
+        gates = _reference_quality_gates(delta, regional_delta)
+        warnings = _diagnostic_warnings(
+            {
+                "regions": {
+                    "sky_top": {
+                        "colorfulness": 36.0,
+                        "blue_dominance": 26.0,
+                        "red_blue_gap": -32.0,
+                    }
+                }
+            },
+            {
+                "regions": {
+                    "sky_top": {
+                        "colorfulness": 68.0,
+                        "blue_dominance": 46.0,
+                        "red_blue_gap": -62.0,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(gates["status"], "needs_work")
+        self.assertTrue(gates["must_not_finalize"])
+        self.assertIn("sky_blue_separation_too_low", gates["failures"])
+        self.assertTrue(any("blue-separated" in suggestion for suggestion in suggestions))
+        self.assertTrue(any("Sky blue separation" in warning for warning in warnings))
 
     def test_raw_render_refuses_to_run_without_explicit_xmp(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-xmp-fail-test-") as tmp:

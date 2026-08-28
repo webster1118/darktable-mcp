@@ -403,6 +403,9 @@ def _image_metrics(image_path: Path) -> dict:
         region_sat = (region_mx - region_mn) / np.maximum(region_mx, 1.0)
         region_rg = region_arr[..., 0] - region_arr[..., 1]
         region_yb = 0.5 * (region_arr[..., 0] + region_arr[..., 1]) - region_arr[..., 2]
+        region_red_mean = float(region_arr[..., 0].mean())
+        region_green_mean = float(region_arr[..., 1].mean())
+        region_blue_mean = float(region_arr[..., 2].mean())
         region_colorfulness = (
             (region_rg.std() ** 2 + region_yb.std() ** 2) ** 0.5
             + 0.3 * (region_rg.mean() ** 2 + region_yb.mean() ** 2) ** 0.5
@@ -422,6 +425,8 @@ def _image_metrics(image_path: Path) -> dict:
             "contrast_span": round(float(np.percentile(region_lum, 95) - np.percentile(region_lum, 5)), 2),
             "detail_gradient_mean": round(float(region_gradient.mean()), 3),
             "detail_laplacian_var": round(float(region_laplacian.var()), 3),
+            "blue_dominance": round(region_blue_mean - ((region_red_mean + region_green_mean) / 2.0), 2),
+            "red_blue_gap": round(region_red_mean - region_blue_mean, 2),
         }
 
     with PILImage.open(image_path) as img:
@@ -441,6 +446,9 @@ def _image_metrics(image_path: Path) -> dict:
         (rg.std() ** 2 + yb.std() ** 2) ** 0.5
         + 0.3 * (rg.mean() ** 2 + yb.mean() ** 2) ** 0.5
     )
+    red_mean = float(arr[..., 0].mean())
+    green_mean = float(arr[..., 1].mean())
+    blue_mean = float(arr[..., 2].mean())
     grad_y, grad_x = np.gradient(lum)
     gradient = np.sqrt(grad_x * grad_x + grad_y * grad_y)
     laplacian = np.gradient(grad_x)[1] + np.gradient(grad_y)[0]
@@ -464,9 +472,11 @@ def _image_metrics(image_path: Path) -> dict:
         "p95": round(float(np.percentile(lum, 95)), 2),
         "saturation_mean": round(float(saturation.mean()), 3),
         "colorfulness": round(float(colorfulness), 3),
-        "red_mean": round(float(arr[..., 0].mean()), 2),
-        "green_mean": round(float(arr[..., 1].mean()), 2),
-        "blue_mean": round(float(arr[..., 2].mean()), 2),
+        "red_mean": round(red_mean, 2),
+        "green_mean": round(green_mean, 2),
+        "blue_mean": round(blue_mean, 2),
+        "blue_dominance": round(blue_mean - ((red_mean + green_mean) / 2.0), 2),
+        "red_blue_gap": round(red_mean - blue_mean, 2),
         "shadow_clip_pct": round(float((lum <= 5).mean() * 100), 3),
         "highlight_clip_pct": round(float((lum >= 250).mean() * 100), 3),
         "contrast_span": round(float(np.percentile(lum, 95) - np.percentile(lum, 5)), 2),
@@ -496,6 +506,8 @@ def _metric_delta(current: dict, baseline: dict) -> dict:
         "red_mean",
         "green_mean",
         "blue_mean",
+        "blue_dominance",
+        "red_blue_gap",
         "contrast_span",
         "detail_gradient_mean",
         "detail_gradient_p95",
@@ -575,10 +587,56 @@ def _reference_match_suggestions(delta: dict, regional_delta: dict) -> list[str]
             suggestions.append(actions["dark"])
         if region_delta.get("saturation_mean", 0.0) < -0.03 or region_delta.get("colorfulness", 0.0) < -5.0:
             suggestions.append(actions["flat"])
+        if region_name == "sky_top" and region_delta.get("blue_dominance", 0.0) < -8.0:
+            suggestions.append(
+                "Sky is not blue-separated enough versus the reference. Use a stronger sky-only native mask "
+                "and verify blue_dominance/colorfulness move toward the reference; do not compensate by "
+                "warming or saturating the whole image."
+            )
+        if region_name == "sky_top" and region_delta.get("red_blue_gap", 0.0) > 12.0:
+            suggestions.append(
+                "Sky is too warm/grey compared with the reference. Reduce sky brightness/exposure if washed out, "
+                "increase local sky chroma/vibrance, and avoid global warmth that pushes red into the sky."
+            )
         if region_delta.get("detail_gradient_mean", 0.0) < -1.5:
             suggestions.append(actions["detail"])
 
     return suggestions
+
+
+def _reference_quality_gates(delta: dict, regional_delta: dict) -> dict:
+    """Return explicit pass/fail gates for reference-guided editing."""
+    failures: list[str] = []
+    sky = regional_delta.get("sky_top") or {}
+    lake = regional_delta.get("lake_lower_mid") or {}
+    foreground = regional_delta.get("foreground_bottom") or {}
+    center = regional_delta.get("center_subject") or {}
+
+    if sky.get("colorfulness", 0.0) < -12.0:
+        failures.append("sky_colorfulness_too_low")
+    if sky.get("blue_dominance", 0.0) < -8.0:
+        failures.append("sky_blue_separation_too_low")
+    if sky.get("red_blue_gap", 0.0) > 12.0:
+        failures.append("sky_too_warm_or_grey")
+    if lake.get("mean", 0.0) < -12.0:
+        failures.append("lake_too_dark")
+    if foreground.get("mean", 0.0) < -18.0:
+        failures.append("foreground_too_dark")
+    if center.get("p50", 0.0) < -12.0:
+        failures.append("center_midtones_too_dark")
+    if delta.get("mean", 0.0) < -8.0 and delta.get("p50", 0.0) < -10.0:
+        failures.append("overall_too_dark")
+
+    return {
+        "status": "pass" if not failures else "needs_work",
+        "failures": failures,
+        "must_not_finalize": bool(failures),
+        "note": (
+            "Do not export/finalize while must_not_finalize is true unless the user explicitly accepts the mismatch."
+            if failures else
+            "No major reference-match gates failed."
+        ),
+    }
 
 
 def _diagnostic_warnings(
@@ -633,6 +691,16 @@ def _diagnostic_warnings(
                 warnings.append(
                     f"{label} region is less colorful than the comparison render; inspect regional hue/chroma, "
                     "not just global saturation."
+                )
+            if region_name == "sky_top" and region_delta.get("blue_dominance", 0.0) < -8.0:
+                warnings.append(
+                    "Sky blue separation is weaker than the comparison render; a visually blue sky needs "
+                    "higher blue_dominance, not only higher saturation."
+                )
+            if region_name == "sky_top" and region_delta.get("red_blue_gap", 0.0) > 12.0:
+                warnings.append(
+                    "Sky is too warm/grey versus the comparison render; reduce red/warm contamination in the "
+                    "sky before accepting the edit."
                 )
             if region_delta.get("detail_gradient_mean", 0.0) < -1.5:
                 warnings.append(
@@ -1060,6 +1128,7 @@ def compare_to_reference(
         "reference": reference_metrics,
         "delta": delta,
         "regional_delta": regional_delta,
+        "reference_quality_gates": _reference_quality_gates(delta, regional_delta),
         "suggested_next_steps": _reference_match_suggestions(delta, regional_delta),
         "diagnostic_warnings": _diagnostic_warnings(current, reference_metrics, state, fast=fast),
     }
