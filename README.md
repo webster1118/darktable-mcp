@@ -13,7 +13,7 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 ## Features
 
 - 🖼️ **RAW file support** — CR2, NEF, ARW, RAF, DNG, ORF, RW2, and more
-- 🎨 **Full editing toolkit** — exposure, white balance, contrast, highlights/shadows, saturation, vibrance, clarity, sharpness, noise reduction, vignette
+- 🎨 **Full editing toolkit** — exposure, white balance, contrast, highlights/shadows, saturation, vibrance, clarity, sharpness, sharpening masking, noise reduction, vignette
 - ✂️ **Crop & rotate** — free crop, aspect ratio crop (16:9, 4:3, 1:1…), straighten
 - 📝 **Rename outputs** — give your exports meaningful names
 - 📊 **Histogram analysis** — Claude checks clipping and tonal distribution before suggesting edits
@@ -132,7 +132,7 @@ My photos are in /Users/me/Pictures/Trip
 
 Make IMG_3500 warmer and more punchy — it looks flat and cold.
 
-Crop it to 16:9 and export as JPEG at maximum quality, name it "jodhpur_desert".
+Crop it to 16:9 and export as JPEG at quality 100, name it "jodhpur_desert".
 ```
 
 Claude will:
@@ -183,8 +183,10 @@ the bridge tools instead of calling a hardcoded preset. For example:
 Edit this iPhone RAW so it feels like bright sunny daylight as I remember the
 scene: professional, natural, clear sky and water, detailed mountains, not HDR
 and not oversaturated. Use render_and_analyze after each edit pass. Prefer
-native Darktable/XMP adjustments. Do not use local masks unless I ask for them.
-Export full size when the preview is good.
+native Darktable/XMP adjustments, and use local adjustments when sky, mountains,
+water, or foreground need separate treatment. For final detail, start near my
+Lightroom habit of sharpening 70 and sharpening masking 70, then compare to the
+reference/detail metrics. Export full size at quality 100 when the preview is good.
 ```
 
 ---
@@ -196,7 +198,8 @@ Each image gets a companion `.mcp.json` sidecar file (e.g. `IMG_3500.mcp.json`) 
 On RAW/DNG export, Darktable handles the RAW render through `darktable-cli`.
 The MCP writes a Darktable-compatible `.xmp` sidecar for verified Darktable 5.6
 module payloads including exposure, white balance/temperature, basic tone,
-color balance RGB, sigmoid, haze removal, simple crop, sharpen, and vignette.
+color balance RGB, sigmoid, haze removal, simple crop, sharpen, sharpening
+masking, and vignette.
 Shadows/whites/blacks use tone equalizer, denoise uses profiled denoise, and
 clarity uses local contrast. Local masks and rotated crops still use the MCP
 finishing pass until their native Darktable payloads are verified.

@@ -43,6 +43,7 @@ class AdjustmentState:
 
     # --- Detail ---
     sharpness: float = 0.0      # 0 to 100
+    sharpening_masking: float = 0.0  # 0 to 100; edge-masked sharpening, Lightroom-like
     noise_reduction: float = 0.0  # 0 to 100
 
     # --- Effects ---
@@ -167,6 +168,7 @@ class EditState:
             a.saturation != defaults.saturation,
             a.temperature_kelvin is not None,
             a.sharpness != defaults.sharpness,
+            a.sharpening_masking != defaults.sharpening_masking,
             a.noise_reduction != defaults.noise_reduction,
             a.vignette != defaults.vignette,
             a.clarity != defaults.clarity,

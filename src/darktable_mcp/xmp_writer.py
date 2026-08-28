@@ -233,7 +233,7 @@ def _crop_ratio(crop: CropState) -> tuple[int, int]:
     return -1, -1
 
 
-def _encode_sharpen(amount: float) -> str:
+def _encode_sharpen(amount: float, masking: float = 0.0) -> str:
     """sharpen module version 1.
 
     struct dt_iop_sharpen_params_t {
@@ -242,9 +242,12 @@ def _encode_sharpen(amount: float) -> str:
         float threshold;
     }
     """
-    radius = 1.5 + amount / 100.0 * 4.0
-    amt = amount / 100.0 * 0.5
-    data = struct.pack("<fff", radius, amt, 0.01)
+    clamped_amount = max(0.0, min(100.0, amount))
+    clamped_masking = max(0.0, min(100.0, masking))
+    radius = 1.0 + clamped_amount / 100.0 * 3.0
+    amt = clamped_amount / 100.0 * 0.75
+    threshold = 0.005 + clamped_masking / 100.0 * 0.055
+    data = struct.pack("<fff", radius, amt, threshold)
     return data.hex()
 
 
@@ -507,7 +510,7 @@ def write_xmp(edit_state: EditState) -> Path:
 
     # Sharpening
     if adj.sharpness > 0:
-        items.append(_item("sharpen", 1, _encode_sharpen(adj.sharpness)))
+        items.append(_item("sharpen", 1, _encode_sharpen(adj.sharpness, adj.sharpening_masking)))
 
     # Profiled denoise
     if adj.noise_reduction > 0:

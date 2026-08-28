@@ -125,6 +125,9 @@ class DarktableFinishingTests(unittest.TestCase):
             "p95": 142.0,
             "saturation_mean": 0.25,
             "contrast_span": 124.0,
+            "detail_gradient_mean": 8.0,
+            "detail_gradient_p95": 32.0,
+            "detail_laplacian_var": 210.0,
         }
         baseline = {
             "mean": 100.0,
@@ -133,6 +136,9 @@ class DarktableFinishingTests(unittest.TestCase):
             "p95": 165.0,
             "saturation_mean": 0.24,
             "contrast_span": 148.0,
+            "detail_gradient_mean": 12.0,
+            "detail_gradient_p95": 40.0,
+            "detail_laplacian_var": 360.0,
         }
         state = EditState(source_path=Path("photo.dng"))
 
@@ -140,9 +146,16 @@ class DarktableFinishingTests(unittest.TestCase):
         warnings = _diagnostic_warnings(current, baseline, state)
 
         self.assertEqual(delta["mean"], -12.0)
+        self.assertEqual(delta["detail_gradient_mean"], -4.0)
         self.assertTrue(any("darker" in warning for warning in warnings))
+        self.assertTrue(any("edge/detail" in warning for warning in warnings))
         self.assertTrue(any("No crop" in warning for warning in warnings))
         self.assertTrue(any("No local adjustments" in warning for warning in warnings))
+
+    def test_fast_warning_flags_disabled_sharpening(self) -> None:
+        warnings = _diagnostic_warnings({}, fast=True)
+
+        self.assertTrue(any("Fast render mode disables sharpening" in warning for warning in warnings))
 
     def test_raw_render_refuses_to_run_without_explicit_xmp(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-xmp-fail-test-") as tmp:

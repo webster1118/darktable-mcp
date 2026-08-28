@@ -402,8 +402,14 @@ class ImageProcessor:
 
         # Sharpness
         if adj.sharpness > 0:
-            factor = 1.0 + adj.sharpness / 50.0
-            img = ImageEnhance.Sharpness(img).enhance(factor)
+            if adj.sharpening_masking > 0:
+                radius = 1.0 + adj.sharpness / 100.0 * 2.0
+                percent = int(adj.sharpness / 100.0 * 180)
+                threshold = int(adj.sharpening_masking / 100.0 * 12)
+                img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+            else:
+                factor = 1.0 + adj.sharpness / 50.0
+                img = ImageEnhance.Sharpness(img).enhance(factor)
 
         # Noise reduction
         if adj.noise_reduction > 0:

@@ -111,6 +111,7 @@ def _darktable_finish_state(state: EditState) -> EditState:
         saturation=0.0,
         vibrance=0.0,
         sharpness=0.0,
+        sharpening_masking=0.0,
         noise_reduction=0.0,
         vignette=0.0,
         clarity=0.0,
@@ -164,7 +165,7 @@ def _finish_darktable_render(
     output_path: Path,
     *,
     format_name: str = "jpeg",
-    quality: int = 92,
+    quality: int = 100,
     max_dimension: Optional[int] = None,
 ) -> None:
     """Apply MCP-side finishing after a Darktable RAW render."""
@@ -188,7 +189,7 @@ def _export_state_to_path(
     state: EditState,
     out_path: Path,
     format_name: str = "jpeg",
-    quality: int = 92,
+    quality: int = 100,
     use_darktable_cli: bool = True,
     write_xmp_sidecar: bool = True,
     max_dimension: Optional[int] = None,
@@ -311,11 +312,17 @@ def _image_metrics(image_path: Path) -> dict:
 
     with PILImage.open(image_path) as img:
         width, height = img.size
-        arr = np.array(img.convert("RGB"), dtype=np.float32)
+        rgb = img.convert("RGB")
+        metric_img = rgb.copy()
+        metric_img.thumbnail((1600, 1600), PILImage.LANCZOS)
+        arr = np.array(metric_img, dtype=np.float32)
     lum = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
     mx = arr.max(axis=2)
     mn = arr.min(axis=2)
     saturation = (mx - mn) / np.maximum(mx, 1.0)
+    grad_y, grad_x = np.gradient(lum)
+    gradient = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+    laplacian = np.gradient(grad_x)[1] + np.gradient(grad_y)[0]
     return {
         "width": width,
         "height": height,
@@ -328,6 +335,9 @@ def _image_metrics(image_path: Path) -> dict:
         "shadow_clip_pct": round(float((lum <= 5).mean() * 100), 3),
         "highlight_clip_pct": round(float((lum >= 250).mean() * 100), 3),
         "contrast_span": round(float(np.percentile(lum, 95) - np.percentile(lum, 5)), 2),
+        "detail_gradient_mean": round(float(gradient.mean()), 3),
+        "detail_gradient_p95": round(float(np.percentile(gradient, 95)), 3),
+        "detail_laplacian_var": round(float(laplacian.var()), 3),
     }
 
 
@@ -336,7 +346,17 @@ def _luminance_metrics(image_path: Path) -> dict:
 
 
 def _metric_delta(current: dict, baseline: dict) -> dict:
-    keys = ["mean", "p05", "p50", "p95", "saturation_mean", "contrast_span"]
+    keys = [
+        "mean",
+        "p05",
+        "p50",
+        "p95",
+        "saturation_mean",
+        "contrast_span",
+        "detail_gradient_mean",
+        "detail_gradient_p95",
+        "detail_laplacian_var",
+    ]
     return {
         key: round(float(current[key] - baseline[key]), 3)
         for key in keys
@@ -344,8 +364,19 @@ def _metric_delta(current: dict, baseline: dict) -> dict:
     }
 
 
-def _diagnostic_warnings(current: dict, baseline: Optional[dict] = None, state: Optional[EditState] = None) -> list[str]:
+def _diagnostic_warnings(
+    current: dict,
+    baseline: Optional[dict] = None,
+    state: Optional[EditState] = None,
+    *,
+    fast: bool = False,
+) -> list[str]:
     warnings: list[str] = []
+    if fast:
+        warnings.append(
+            "Fast render mode disables sharpening and noise reduction. Do a non-fast render "
+            "before judging final sharpness or comparing detail to a reference."
+        )
     if baseline:
         delta = _metric_delta(current, baseline)
         if delta.get("mean", 0.0) < -5.0:
@@ -362,6 +393,11 @@ def _diagnostic_warnings(current: dict, baseline: Optional[dict] = None, state: 
             warnings.append(
                 "Current render is flatter than the unedited render; add contrast, "
                 "sigmoid contrast, clarity, or local contrast if a crisp result is wanted."
+            )
+        if delta.get("detail_gradient_mean", 0.0) < -1.0:
+            warnings.append(
+                "Current render has less measured edge/detail contrast than the comparison render; "
+                "increase sharpening, clarity/local contrast, or dehaze, and reduce denoise if over-smoothed."
             )
     if state:
         if state.crop is None:
@@ -515,6 +551,7 @@ def get_darktable_status() -> dict:
             "dehaze",
             "crop_without_rotation",
             "sharpness",
+            "sharpening_masking",
             "noise_reduction",
             "clarity",
             "vignette",
@@ -661,14 +698,19 @@ def render_and_analyze(
         "baseline": baseline_metrics,
         "baseline_render": baseline_result,
         "delta_from_original": _metric_delta(analysis, baseline_metrics) if baseline_metrics else None,
-        "diagnostic_warnings": _diagnostic_warnings(analysis, baseline_metrics, state),
+        "diagnostic_warnings": _diagnostic_warnings(analysis, baseline_metrics, state, fast=fast),
     })
     return [analysis, Image(data=img_bytes, format="jpeg")]
 
 
 @mcp.tool()
-def compare_to_reference(image_path: str, reference_image_path: str, max_size: int = 1200) -> dict:
-    """Render current edits and compare simple tone/color metrics to a reference JPEG."""
+def compare_to_reference(
+    image_path: str,
+    reference_image_path: str,
+    max_size: int = 1200,
+    fast: bool = False,
+) -> dict:
+    """Render current edits and compare tone/color/detail metrics to a reference JPEG."""
     try:
         path, state = _load_or_new(image_path)
     except FileNotFoundError as e:
@@ -680,24 +722,21 @@ def compare_to_reference(image_path: str, reference_image_path: str, max_size: i
     preview_dir = path.parent / ".darktable-mcp-preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview_path = preview_dir / f"{path.stem}__compare.jpg"
-    result, _img_bytes = _render_current_edits_to_file(path, state, preview_path, max_size, fast=True)
+    result, _img_bytes = _render_current_edits_to_file(path, state, preview_path, max_size, fast=fast)
     if result.get("status") != "ok":
         return result
 
     current = _image_metrics(preview_path)
     reference_metrics = _image_metrics(reference)
-    keys = ["mean", "p05", "p50", "p95", "saturation_mean", "contrast_span"]
     return {
         "status": "ok",
         "preview_path": str(preview_path),
         "reference_path": str(reference),
+        "fast": fast,
         "current": current,
         "reference": reference_metrics,
-        "delta": {
-            key: round(float(current[key] - reference_metrics[key]), 3)
-            for key in keys
-            if key in current and key in reference_metrics
-        },
+        "delta": _metric_delta(current, reference_metrics),
+        "diagnostic_warnings": _diagnostic_warnings(current, reference_metrics, state, fast=fast),
     }
 
 
@@ -726,6 +765,7 @@ def apply_adjustments(
     vibrance: Optional[float] = None,
     # Detail
     sharpness: Optional[float] = None,
+    sharpening_masking: Optional[float] = None,
     noise_reduction: Optional[float] = None,
     # Effects
     vignette: Optional[float] = None,
@@ -778,6 +818,9 @@ def apply_adjustments(
         Selective saturation boost for muted colours (-100 to +100).
     sharpness : float
         Sharpening strength (0 to 100).
+    sharpening_masking : float
+        Edge masking for sharpening (0 to 100). Similar in intent to Lightroom's
+        sharpening masking slider: higher values protect smooth areas such as sky.
     noise_reduction : float
         Noise reduction strength (0 to 100).
     vignette : float
@@ -810,6 +853,7 @@ def apply_adjustments(
         "saturation": saturation,
         "vibrance": vibrance,
         "sharpness": sharpness,
+        "sharpening_masking": sharpening_masking,
         "noise_reduction": noise_reduction,
         "vignette": vignette,
         "clarity": clarity,
@@ -1121,7 +1165,7 @@ def export_image(
     image_path: str,
     output_directory: Optional[str] = None,
     format: str = "jpeg",
-    quality: int = 92,
+    quality: int = 100,
     use_darktable_cli: bool = True,
     write_xmp_sidecar: bool = True,
     max_dimension: Optional[int] = None,
@@ -1142,7 +1186,7 @@ def export_image(
     format : str
         Output format: "jpeg", "png", "tiff" (default "jpeg").
     quality : int
-        JPEG quality 1–100 (default 92).  Ignored for PNG/TIFF.
+        JPEG quality 1–100 (default 100).  Ignored for PNG/TIFF.
     use_darktable_cli : bool
         Try to use darktable-cli for export when available (better RAW rendering).
     write_xmp_sidecar : bool

@@ -1,4 +1,6 @@
 from pathlib import Path
+import re
+import struct
 import tempfile
 import unittest
 
@@ -58,6 +60,7 @@ class XmpWriterTests(unittest.TestCase):
             state.adjustments.whites = 8
             state.adjustments.blacks = -4
             state.adjustments.sharpness = 18
+            state.adjustments.sharpening_masking = 70
             state.adjustments.noise_reduction = 12
             state.adjustments.clarity = 10
             state.adjustments.vignette = -10
@@ -73,3 +76,12 @@ class XmpWriterTests(unittest.TestCase):
         self.assertIn('darktable:operation="denoiseprofile"', xmp)
         self.assertIn('darktable:operation="bilat"', xmp)
         self.assertIn('darktable:operation="vignette"', xmp)
+
+        sharpen_match = re.search(
+            r'darktable:operation="sharpen".*?darktable:params="([0-9a-f]+)"',
+            xmp,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(sharpen_match)
+        _radius, _amount, threshold = struct.unpack("<fff", bytes.fromhex(sharpen_match.group(1)))
+        self.assertGreater(threshold, 0.03)

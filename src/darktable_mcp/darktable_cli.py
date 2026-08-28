@@ -49,7 +49,7 @@ class DarktableCli:
         destination: Path,
         xmp: Optional[Path] = None,
         *,
-        quality: int = 92,
+        quality: int = 100,
         max_dimension: Optional[int] = None,
         config_directory: Optional[Path] = None,
     ) -> list[str]:
@@ -79,7 +79,7 @@ class DarktableCli:
         destination: Path,
         xmp: Optional[Path] = None,
         *,
-        quality: int = 92,
+        quality: int = 100,
         max_dimension: Optional[int] = None,
         allow_dng_conversion: bool = True,
         config_directory: Optional[Path] = None,

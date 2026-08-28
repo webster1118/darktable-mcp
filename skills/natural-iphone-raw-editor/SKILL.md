@@ -16,7 +16,7 @@ The MCP server is only the bridge to Darktable. Do the creative judgment in the 
 5. Compare the image to the user's words and any reference image.
 6. Iterate until the edit is close, then export full size with `export_image`.
 
-Prefer native Darktable/XMP adjustments. Do not use MCP local masks unless the user asks for local masking or the global tools cannot solve a specific visible problem.
+Prefer native Darktable/XMP adjustments. Start globally, but use local adjustments when distinct regions such as sky, mountains, water, foreground, or trees need separate treatment.
 
 ## Useful bridge tools
 
@@ -28,7 +28,7 @@ Prefer native Darktable/XMP adjustments. Do not use MCP local masks unless the u
 - `apply_adjustments`: set explicit slider-like fields.
 - `crop_image`, `rotate_image`, `reset_crop`: geometry.
 - `convert_dng_if_needed`: explicit ProRAW conversion diagnostics; normal render/export already auto-converts or retries when needed.
-- `export_image`: final output. Do not set `max_dimension` unless the user asks for resizing.
+- `export_image`: final output. Use `quality=100` and do not set `max_dimension` unless the user asks for resizing.
 
 ## Editing taste
 
@@ -41,6 +41,9 @@ For "natural sunny professional" iPhone travel photos:
 - Prefer vibrance before heavy saturation. Increase saturation only when colors are clearly dull.
 - Watch water and sky separately by eye. Turquoise water should stay clean, not radioactive; blue sky should stay natural, not cyan-plastic.
 - If a reference edit exists, match its tonal/color direction, not necessarily every metric exactly.
+- For final full-quality iPhone RAW exports, treat the user's normal Lightroom detail baseline as sharpening 70 and masking 70. In MCP terms, start final detail passes around `sharpness: 70` and `sharpening_masking: 70`, then adjust by comparing real detail metrics and inspecting the image. This masking means edge-protected sharpening, not a local subject mask.
+- Do not judge final sharpness from `fast=true` renders. Fast renders disable sharpening/noise reduction for speed. Use `compare_to_reference(..., fast=false)` when a reference is available.
+- Keep noise reduction conservative for bright daylight iPhone RAW unless noise is visible. Too much denoise can produce the soft, smeared look the user dislikes.
 
 ## Practical iteration pattern
 
@@ -61,8 +64,9 @@ apply_edit_recipe({
     "saturation": 4,
     "dehaze": 8,
     "clarity": 6,
-    "sharpness": 12,
-    "noise_reduction": 5
+    "sharpness": 50,
+    "sharpening_masking": 70,
+    "noise_reduction": 2
   },
   "crop": {"top": 0.125, "bottom": 0.875},
   "clear_local_masks": true
@@ -76,5 +80,6 @@ Then call `render_and_analyze`. Adjust from the rendered result:
 - Washed out/flat: lower `shadows`, lower `blacks`, or increase `sigmoid_contrast`.
 - Harsh/HDR: reduce `clarity`, `dehaze`, `sigmoid_contrast`, and saturation.
 - Sky/water too artificial: reduce saturation/vibrance or adjust temperature/tint.
+- Too soft compared with reference: raise `sharpness` toward 70, keep `sharpening_masking` around 70 to protect sky/noise, increase clarity/dehaze locally on mountains/trees, and avoid unnecessary denoise.
 
-Stop when the rendered preview satisfies the user's description. Export full size by omitting `max_dimension`.
+Stop when the rendered preview satisfies the user's description. Export full size with `quality=100` and by omitting `max_dimension`.

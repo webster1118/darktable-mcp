@@ -40,7 +40,13 @@ class DarktableCliCommandTests(unittest.TestCase):
         cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
         command = cli.build_export_command(self.tmp_path / "photo.DNG", self.tmp_path / "result.png")
 
-        self.assertNotIn("plugins/imageio/format/jpeg/quality=92", command)
+        self.assertFalse(any(item.startswith("plugins/imageio/format/jpeg/quality=") for item in command))
+
+    def test_jpeg_export_defaults_to_max_quality(self) -> None:
+        cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
+        command = cli.build_export_command(self.tmp_path / "photo.DNG", self.tmp_path / "result.jpg")
+
+        self.assertIn("plugins/imageio/format/jpeg/quality=100", command)
 
     def test_uses_a_supplied_isolated_darktable_config(self) -> None:
         cli = DarktableCli(self.tmp_path / "darktable-cli.exe")
