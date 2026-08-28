@@ -137,11 +137,12 @@ Crop it to 16:9 and export as JPEG at quality 100, name it "jodhpur_desert".
 
 Claude will:
 1. Call `list_images` to see your folder
-2. Call `render_and_analyze` to see the current Darktable render and metrics
-3. Call `apply_edit_recipe` or `apply_adjustments` with specific values
-4. Render/analyze again and decide whether the edit matched your description
-5. Iterate until the image matches the requested look
-6. Export the final image at full size when you're happy
+2. Call `get_image_info` and apply a recommended ProRAW starting point when needed
+3. Call `render_and_analyze` to see the current Darktable render and metrics
+4. Call `apply_edit_recipe` or `apply_adjustments` with specific values
+5. Render/analyze again and decide whether the edit matched your description
+6. Iterate until the image matches the requested look
+7. Export the final image at full size when you're happy
 
 ### Available tools
 
@@ -150,6 +151,7 @@ Claude will:
 | `list_images` | List all images in a directory |
 | `get_image_info` | EXIF metadata + current edit state |
 | `get_darktable_status` | Show Darktable CLI discovery and supported v2 edit routing |
+| `apply_starting_point` | Apply a neutral ProRAW/RAW normalization starting point |
 | `get_image_preview` | Render and preview with edits applied |
 | `render_and_analyze` | Render current edits and return a preview plus tone/color metrics |
 | `compare_to_reference` | Compare current render metrics to a reference JPEG |
@@ -163,6 +165,7 @@ Claude will:
 | `reset_masks` | Remove all local masks |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF |
+| `cleanup_temporary_files` | Remove MCP-generated preview/analysis files |
 | `reset_edits` | Undo everything, back to original |
 | `get_histogram` | Tonal/clipping analysis |
 | `copy_settings` | Copy edits from one image to another |
@@ -188,6 +191,12 @@ water, or foreground need separate treatment. For final detail, start near my
 Lightroom habit of sharpening 70 and sharpening masking 70, then compare to the
 reference/detail metrics. Export full size at quality 100 when the preview is good.
 ```
+
+For Apple ProRAW files, `get_image_info` and `get_current_edits` can recommend
+the `apple_proraw_natural` starting point. This is a neutral first-pass
+normalization for Darktable's dark/flat ProRAW render, not a finished style.
+Final export removes MCP-generated preview/analysis files by default; use
+`cleanup_temporary_files` if you want to clean them manually.
 
 ---
 

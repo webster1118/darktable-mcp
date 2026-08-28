@@ -11,6 +11,7 @@ from mcp.server.mcpserver import MCPServer, Image
 from PIL import Image as PILImage
 
 from .darktable_cli import DarktableCli
+from .dng_converter import is_probably_apple_proraw
 from .edits import CropState, EditState, LocalAdjustmentState
 from .processor import ALL_EXTENSIONS, RAW_EXTENSIONS, ImageProcessor
 from .xmp_writer import write_xmp
@@ -25,12 +26,100 @@ mcp = MCPServer("DarktableMCP")
 DARKTABLE = DarktableCli.discover()
 
 
+STARTING_POINTS: dict[str, dict] = {
+    "apple_proraw_natural": {
+        "description": (
+            "Neutral Apple ProRAW starting point for Darktable's initially flat/dark "
+            "conversion. Intended as a first-pass normalization, not a final look."
+        ),
+        "adjustments": {
+            "exposure_ev": 0.6,
+            "brightness": 10,
+            "highlights": 8,
+            "shadows": 28,
+            "whites": 6,
+            "blacks": -5,
+            "sigmoid_contrast": 10,
+            "sigmoid_skew": -5,
+            "vibrance": 12,
+            "saturation": 3,
+            "clarity": 8,
+            "dehaze": 6,
+            "sharpness": 70,
+            "sharpening_masking": 70,
+            "noise_reduction": 2,
+        },
+    }
+}
+
+
 def _load_or_new(image_path: str) -> tuple[Path, EditState]:
     path = Path(image_path)
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
     state = EditState.load(path) or EditState(source_path=path)
     return path, state
+
+
+def _looks_like_apple_proraw(path: Path) -> bool:
+    return path.suffix.lower() == ".dng" and is_probably_apple_proraw(path)
+
+
+def _recommended_starting_point(path: Path, state: EditState) -> Optional[dict]:
+    if state.has_changes():
+        return None
+    if _looks_like_apple_proraw(path):
+        profile = STARTING_POINTS["apple_proraw_natural"]
+        return {
+            "profile": "apple_proraw_natural",
+            "reason": "Apple ProRAW DNGs often render dark/flat as a neutral Darktable starting point.",
+            "adjustments": profile["adjustments"],
+        }
+    return None
+
+
+def _apply_starting_point_to_state(state: EditState, profile_name: str) -> list[str]:
+    profile = STARTING_POINTS.get(profile_name)
+    if not profile:
+        raise ValueError(f"Unknown starting point: {profile_name}")
+    adjustments = profile["adjustments"]
+    state.update(adjustments)
+    return list(adjustments.keys())
+
+
+def _cleanup_generated_files(path: Path, *, include_converted: bool = False) -> dict:
+    """Delete MCP-generated temporary artifacts for one source image."""
+    removed: list[str] = []
+    errors: list[dict] = []
+
+    candidates: list[Path] = []
+    preview_dir = path.parent / ".darktable-mcp-preview"
+    if preview_dir.is_dir():
+        candidates.extend(
+            item for item in preview_dir.iterdir()
+            if item.is_file() and item.name.startswith(f"{path.stem}__")
+        )
+
+    preview_copy = path.with_name(path.stem + "__preview.jpg")
+    if preview_copy.exists() and preview_copy.is_file():
+        candidates.append(preview_copy)
+
+    if include_converted:
+        converted_dir = path.parent / ".darktable-mcp-converted"
+        if converted_dir.is_dir():
+            candidates.extend(
+                item for item in converted_dir.iterdir()
+                if item.is_file() and item.stem == path.stem
+            )
+
+    for candidate in candidates:
+        try:
+            candidate.unlink()
+            removed.append(str(candidate))
+        except OSError as exc:
+            errors.append({"path": str(candidate), "error": str(exc)})
+
+    return {"removed": removed, "errors": errors}
 
 
 def _quick_preview(path: Path, state: EditState, max_size: int):
@@ -310,19 +399,64 @@ def _export_state_to_path(
 def _image_metrics(image_path: Path) -> dict:
     import numpy as np
 
+    def _summarize_region(region_arr: np.ndarray) -> dict:
+        region_lum = 0.299 * region_arr[..., 0] + 0.587 * region_arr[..., 1] + 0.114 * region_arr[..., 2]
+        region_mx = region_arr.max(axis=2)
+        region_mn = region_arr.min(axis=2)
+        region_sat = (region_mx - region_mn) / np.maximum(region_mx, 1.0)
+        region_rg = region_arr[..., 0] - region_arr[..., 1]
+        region_yb = 0.5 * (region_arr[..., 0] + region_arr[..., 1]) - region_arr[..., 2]
+        region_colorfulness = (
+            (region_rg.std() ** 2 + region_yb.std() ** 2) ** 0.5
+            + 0.3 * (region_rg.mean() ** 2 + region_yb.mean() ** 2) ** 0.5
+        )
+        region_grad_y, region_grad_x = np.gradient(region_lum)
+        region_gradient = np.sqrt(region_grad_x * region_grad_x + region_grad_y * region_grad_y)
+        region_laplacian = np.gradient(region_grad_x)[1] + np.gradient(region_grad_y)[0]
+        return {
+            "mean": round(float(region_lum.mean()), 2),
+            "p50": round(float(np.percentile(region_lum, 50)), 2),
+            "p95": round(float(np.percentile(region_lum, 95)), 2),
+            "saturation_mean": round(float(region_sat.mean()), 3),
+            "colorfulness": round(float(region_colorfulness), 3),
+            "red_mean": round(float(region_arr[..., 0].mean()), 2),
+            "green_mean": round(float(region_arr[..., 1].mean()), 2),
+            "blue_mean": round(float(region_arr[..., 2].mean()), 2),
+            "contrast_span": round(float(np.percentile(region_lum, 95) - np.percentile(region_lum, 5)), 2),
+            "detail_gradient_mean": round(float(region_gradient.mean()), 3),
+            "detail_laplacian_var": round(float(region_laplacian.var()), 3),
+        }
+
     with PILImage.open(image_path) as img:
         width, height = img.size
         rgb = img.convert("RGB")
         metric_img = rgb.copy()
         metric_img.thumbnail((1600, 1600), PILImage.LANCZOS)
         arr = np.array(metric_img, dtype=np.float32)
+    metric_height, metric_width = arr.shape[:2]
     lum = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
     mx = arr.max(axis=2)
     mn = arr.min(axis=2)
     saturation = (mx - mn) / np.maximum(mx, 1.0)
+    rg = arr[..., 0] - arr[..., 1]
+    yb = 0.5 * (arr[..., 0] + arr[..., 1]) - arr[..., 2]
+    colorfulness = (
+        (rg.std() ** 2 + yb.std() ** 2) ** 0.5
+        + 0.3 * (rg.mean() ** 2 + yb.mean() ** 2) ** 0.5
+    )
     grad_y, grad_x = np.gradient(lum)
     gradient = np.sqrt(grad_x * grad_x + grad_y * grad_y)
     laplacian = np.gradient(grad_x)[1] + np.gradient(grad_y)[0]
+    regions = {
+        "sky_top": arr[: max(2, int(metric_height * 0.30)), :],
+        "mountains_mid": arr[int(metric_height * 0.18): max(int(metric_height * 0.62), int(metric_height * 0.18) + 2), :],
+        "lake_lower_mid": arr[int(metric_height * 0.58): max(int(metric_height * 0.78), int(metric_height * 0.58) + 2), :],
+        "foreground_bottom": arr[int(metric_height * 0.72):, :],
+        "center_subject": arr[
+            int(metric_height * 0.20): max(int(metric_height * 0.68), int(metric_height * 0.20) + 2),
+            int(metric_width * 0.15): max(int(metric_width * 0.85), int(metric_width * 0.15) + 2),
+        ],
+    }
     return {
         "width": width,
         "height": height,
@@ -332,12 +466,21 @@ def _image_metrics(image_path: Path) -> dict:
         "p50": round(float(np.percentile(lum, 50)), 2),
         "p95": round(float(np.percentile(lum, 95)), 2),
         "saturation_mean": round(float(saturation.mean()), 3),
+        "colorfulness": round(float(colorfulness), 3),
+        "red_mean": round(float(arr[..., 0].mean()), 2),
+        "green_mean": round(float(arr[..., 1].mean()), 2),
+        "blue_mean": round(float(arr[..., 2].mean()), 2),
         "shadow_clip_pct": round(float((lum <= 5).mean() * 100), 3),
         "highlight_clip_pct": round(float((lum >= 250).mean() * 100), 3),
         "contrast_span": round(float(np.percentile(lum, 95) - np.percentile(lum, 5)), 2),
         "detail_gradient_mean": round(float(gradient.mean()), 3),
         "detail_gradient_p95": round(float(np.percentile(gradient, 95)), 3),
         "detail_laplacian_var": round(float(laplacian.var()), 3),
+        "regions": {
+            name: _summarize_region(region_arr)
+            for name, region_arr in regions.items()
+            if region_arr.size
+        },
     }
 
 
@@ -352,6 +495,10 @@ def _metric_delta(current: dict, baseline: dict) -> dict:
         "p50",
         "p95",
         "saturation_mean",
+        "colorfulness",
+        "red_mean",
+        "green_mean",
+        "blue_mean",
         "contrast_span",
         "detail_gradient_mean",
         "detail_gradient_p95",
@@ -362,6 +509,79 @@ def _metric_delta(current: dict, baseline: dict) -> dict:
         for key in keys
         if key in current and key in baseline
     }
+
+
+def _regional_metric_delta(current: dict, baseline: dict) -> dict:
+    current_regions = current.get("regions") or {}
+    baseline_regions = baseline.get("regions") or {}
+    return {
+        region_name: _metric_delta(region_metrics, baseline_regions[region_name])
+        for region_name, region_metrics in current_regions.items()
+        if region_name in baseline_regions
+    }
+
+
+def _reference_match_suggestions(delta: dict, regional_delta: dict) -> list[str]:
+    suggestions: list[str] = []
+    if delta.get("saturation_mean", 0.0) < -0.02 or delta.get("colorfulness", 0.0) < -4.0:
+        suggestions.append(
+            "Overall color is less lively than the reference. Prefer vibrance/color balance first; "
+            "use saturation carefully and check sky/water for artificial color."
+        )
+    if delta.get("p50", 0.0) < -4.0 and delta.get("mean", 0.0) >= -2.0:
+        suggestions.append(
+            "Average brightness is close but midtones are low. Lift brightness/shadows or adjust sigmoid skew "
+            "instead of pushing exposure/highlights."
+        )
+    if delta.get("p05", 0.0) > 4.0:
+        suggestions.append(
+            "Shadow floor is higher than the reference. Deepen blacks or reduce shadow lift to restore depth."
+        )
+    if delta.get("detail_gradient_mean", 0.0) < -0.8:
+        suggestions.append(
+            "Measured fine detail is lower than the reference. Increase sharpening/local clarity/dehaze, "
+            "or reduce denoise if the image looks smeared."
+        )
+
+    region_actions = {
+        "sky_top": {
+            "dark": "Sky is darker than the reference; brighten it locally only if the visual reference supports it.",
+            "flat": "Sky is flatter/less colorful than the reference; adjust sky vibrance/blue depth locally.",
+            "detail": "Sky/upper haze lacks edge separation; use very gentle local dehaze/contrast and avoid halos.",
+        },
+        "mountains_mid": {
+            "dark": "Mountains are darker than the reference; use a mountain/center local lift rather than global exposure.",
+            "flat": "Mountains lack punch; add local contrast/clarity/dehaze on rock and green slopes.",
+            "detail": "Mountain detail is low; add local clarity/dehaze/sharpening on the mountain region.",
+        },
+        "lake_lower_mid": {
+            "dark": "Lake is darker than the reference; brighten lake midtones locally without lifting the whole frame.",
+            "flat": "Lake color is less lively than the reference; increase lake vibrance/saturation locally but avoid neon cyan.",
+            "detail": "Lake region detail/edge separation differs; keep water smooth and prioritize natural color over texture.",
+        },
+        "foreground_bottom": {
+            "dark": "Foreground is darker than the reference; lift shadows locally while preserving believable tree depth.",
+            "flat": "Foreground color/depth differs; tune local contrast and greens without making trees gray.",
+            "detail": "Foreground detail is low; use local clarity/sharpening and keep denoise minimal.",
+        },
+        "center_subject": {
+            "dark": "Center subject is darker than the reference; lift midtones locally or adjust sigmoid/brightness.",
+            "flat": "Center subject is flatter or less colorful; use targeted contrast and vibrance rather than global shifts.",
+            "detail": "Center subject detail is low; add local clarity/dehaze on the main subject area.",
+        },
+    }
+    for region_name, region_delta in regional_delta.items():
+        actions = region_actions.get(region_name)
+        if not actions:
+            continue
+        if region_delta.get("mean", 0.0) < -6.0 or region_delta.get("p50", 0.0) < -8.0:
+            suggestions.append(actions["dark"])
+        if region_delta.get("saturation_mean", 0.0) < -0.03 or region_delta.get("colorfulness", 0.0) < -5.0:
+            suggestions.append(actions["flat"])
+        if region_delta.get("detail_gradient_mean", 0.0) < -1.5:
+            suggestions.append(actions["detail"])
+
+    return suggestions
 
 
 def _diagnostic_warnings(
@@ -379,6 +599,7 @@ def _diagnostic_warnings(
         )
     if baseline:
         delta = _metric_delta(current, baseline)
+        regional_delta = _regional_metric_delta(current, baseline)
         if delta.get("mean", 0.0) < -5.0:
             warnings.append(
                 "Current render is darker than the unedited Darktable render; "
@@ -399,6 +620,28 @@ def _diagnostic_warnings(
                 "Current render has less measured edge/detail contrast than the comparison render; "
                 "increase sharpening, clarity/local contrast, or dehaze, and reduce denoise if over-smoothed."
             )
+        for region_name, region_delta in regional_delta.items():
+            label = region_name.replace("_", " ")
+            if region_delta.get("mean", 0.0) < -6.0:
+                warnings.append(
+                    f"{label} region is darker than the comparison render; use a targeted local adjustment "
+                    "rather than changing the whole image if only this area is wrong."
+                )
+            if region_delta.get("saturation_mean", 0.0) < -0.03:
+                warnings.append(
+                    f"{label} region is less saturated than the comparison render; adjust regional color/vibrance "
+                    "if the visual reference supports it."
+                )
+            if region_delta.get("colorfulness", 0.0) < -5.0:
+                warnings.append(
+                    f"{label} region is less colorful than the comparison render; inspect regional hue/chroma, "
+                    "not just global saturation."
+                )
+            if region_delta.get("detail_gradient_mean", 0.0) < -1.5:
+                warnings.append(
+                    f"{label} region has less measured detail than the comparison render; use local clarity, "
+                    "dehaze, or sharpening instead of only global tone changes."
+                )
     if state:
         if state.crop is None:
             warnings.append(
@@ -518,6 +761,7 @@ def get_image_info(image_path: str) -> dict:
     info["edits"] = state.to_dict()
     info["darktable_cli_available"] = DARKTABLE is not None
     info["darktable_cli_path"] = str(DARKTABLE.executable) if DARKTABLE else None
+    info["recommended_starting_point"] = _recommended_starting_point(path, state)
     return info
 
 
@@ -532,6 +776,13 @@ def get_darktable_status() -> dict:
         "dng_conversion_mode": "auto; override with DARKTABLE_MCP_DNG_CONVERSION=auto|always|never",
         "raw_rendering": "darktable-cli" if DARKTABLE else "unavailable",
         "workflow": "bridge only; the client/Claude should decide iterative edits",
+        "starting_points": {
+            name: {
+                "description": profile["description"],
+                "adjustments": profile["adjustments"],
+            }
+            for name, profile in STARTING_POINTS.items()
+        },
         "mask_support": ["linear_gradient"],
         "xmp_supported_adjustments": [
             "exposure_ev",
@@ -578,6 +829,50 @@ def get_current_edits(image_path: str) -> dict:
         "status": "ok",
         "edits": state.to_dict(),
         "mcp_finishing_needed": _needs_mcp_finishing(state),
+        "recommended_starting_point": _recommended_starting_point(_path, state),
+    }
+
+
+@mcp.tool()
+def apply_starting_point(
+    image_path: str,
+    profile: str = "apple_proraw_natural",
+    only_if_unedited: bool = True,
+) -> dict:
+    """Apply a neutral RAW starting point before creative editing.
+
+    The default ``apple_proraw_natural`` profile compensates for the dark/flat
+    starting render commonly seen when Apple ProRAW DNGs are opened through a
+    neutral Darktable CLI workflow. It is not a final style preset.
+    """
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"status": "error", "error": str(e)}
+
+    if profile not in STARTING_POINTS:
+        return {
+            "status": "error",
+            "error": f"Unknown starting point profile: {profile}",
+            "available_profiles": sorted(STARTING_POINTS),
+        }
+
+    if only_if_unedited and state.has_changes():
+        return {
+            "status": "skipped",
+            "reason": "Image already has edits; pass only_if_unedited=false to apply anyway.",
+            "edits": state.to_dict(),
+        }
+
+    applied = _apply_starting_point_to_state(state, profile)
+    state.save()
+    return {
+        "status": "ok",
+        "profile": profile,
+        "applied": applied,
+        "is_probably_apple_proraw": _looks_like_apple_proraw(path),
+        "edits": state.to_dict(),
+        "note": STARTING_POINTS[profile]["description"],
     }
 
 
@@ -698,6 +993,7 @@ def render_and_analyze(
         "baseline": baseline_metrics,
         "baseline_render": baseline_result,
         "delta_from_original": _metric_delta(analysis, baseline_metrics) if baseline_metrics else None,
+        "regional_delta_from_original": _regional_metric_delta(analysis, baseline_metrics) if baseline_metrics else None,
         "diagnostic_warnings": _diagnostic_warnings(analysis, baseline_metrics, state, fast=fast),
     })
     return [analysis, Image(data=img_bytes, format="jpeg")]
@@ -728,6 +1024,8 @@ def compare_to_reference(
 
     current = _image_metrics(preview_path)
     reference_metrics = _image_metrics(reference)
+    delta = _metric_delta(current, reference_metrics)
+    regional_delta = _regional_metric_delta(current, reference_metrics)
     return {
         "status": "ok",
         "preview_path": str(preview_path),
@@ -735,7 +1033,9 @@ def compare_to_reference(
         "fast": fast,
         "current": current,
         "reference": reference_metrics,
-        "delta": _metric_delta(current, reference_metrics),
+        "delta": delta,
+        "regional_delta": regional_delta,
+        "suggested_next_steps": _reference_match_suggestions(delta, regional_delta),
         "diagnostic_warnings": _diagnostic_warnings(current, reference_metrics, state, fast=fast),
     }
 
@@ -1161,6 +1461,24 @@ def reset_edits(image_path: str) -> dict:
 
 
 @mcp.tool()
+def cleanup_temporary_files(image_path: str, include_converted: bool = False) -> dict:
+    """Remove MCP-generated temporary preview/analysis files for one source image.
+
+    This removes files in `.darktable-mcp-preview` and the viewer preview copy
+    named `original__preview.jpg`. It does not remove the original image, MCP
+    edit sidecar, Darktable XMP, or final exports. Pass `include_converted=true`
+    to also remove explicit files in `.darktable-mcp-converted` for this source.
+    """
+    path = Path(image_path)
+    if not path.exists():
+        return {"status": "error", "error": f"Image not found: {image_path}"}
+
+    result = _cleanup_generated_files(path, include_converted=include_converted)
+    result["status"] = "ok" if not result["errors"] else "partial"
+    return result
+
+
+@mcp.tool()
 def export_image(
     image_path: str,
     output_directory: Optional[str] = None,
@@ -1169,6 +1487,7 @@ def export_image(
     use_darktable_cli: bool = True,
     write_xmp_sidecar: bool = True,
     max_dimension: Optional[int] = None,
+    cleanup_temporary: bool = True,
 ) -> dict:
     """Export the edited image to a file.
 
@@ -1193,6 +1512,9 @@ def export_image(
         Write a Darktable-compatible XMP sidecar alongside the source file.
     max_dimension : int, optional
         Resize so the longest edge is at most this many pixels.
+    cleanup_temporary : bool
+        Remove MCP-generated preview/analysis files for this image after a
+        successful final export (default true).
     """
     try:
         path, state = _load_or_new(image_path)
@@ -1227,6 +1549,8 @@ def export_image(
         metrics = _image_metrics(out_path)
         result["metrics"] = metrics
         result["diagnostic_warnings"] = _diagnostic_warnings(metrics, state=state)
+        if cleanup_temporary:
+            result["cleanup"] = _cleanup_generated_files(path)
     return result
 
 
