@@ -25,6 +25,7 @@ Linear-gradient, ellipse, path, brush, and parametric local adjustments are writ
 - `get_darktable_status`: confirm Darktable, Adobe DNG Converter, native XMP support, and fallback status.
 - `get_image_info`: inspect dimensions and current sidecar edits.
 - `apply_starting_point`: apply a neutral first-pass profile, especially `apple_proraw_natural`, before creative edits when Apple ProRAW starts too dark/flat.
+- `apply_pweber_lightroom_preset`: apply Peter's Lightroom Adobe Standard vacation baseline. It uses Darktable `+1.2 EV` as profile/base compensation and adds the requested per-photo exposure on top.
 - `render_and_analyze`: render the current edit and return preview plus tone/color metrics. For speed during iteration, call it with `fast=true`, `max_size` around 900-1200, and `compare_to_original=false`. Use `compare_to_original=true` only for first/checkpoint renders because it costs an extra Darktable render.
 - `compare_to_reference`: compare the current render with a reference JPEG when the user provides one. Read `regional_delta`, color/detail metrics, `diagnostic_warnings`, and `suggested_next_steps`.
 - `apply_edit_recipe`: set several supported adjustments/crop/output name in one generic operation.
@@ -53,6 +54,11 @@ Linear-gradient, ellipse, path, brush, and parametric local adjustments are writ
 
 For "natural sunny professional" iPhone travel photos:
 
+- Peter's Lightroom workflow is: apply preset, set exposure, set white balance, perform color correction, then add local masks for focus/unfocus areas. Follow this order when using his personal preset translation.
+- Peter uses Lightroom's `Adobe Standard` profile, even though Lightroom may auto-select `Apple ProRAW` on import. Do not calibrate to Lightroom's Apple ProRAW profile unless he explicitly asks.
+- In Darktable, Peter's Lightroom Adobe Standard base is approximately `+1.2 EV` brighter than the converted ProRAW/Darktable base. Treat this as profile compensation, not creative exposure.
+- When translating Peter's Lightroom exposure decision, use `darktable exposure_ev = 1.2 + photo_exposure_ev`. Example: if Peter would set Lightroom exposure to `+0.2`, use Darktable/MCP `+1.4 EV`; if he would set `+1.2`, use `+2.4 EV`.
+- Prefer `apply_pweber_lightroom_preset(photo_exposure_ev=...)` when editing in Peter's vacation style so the MCP performs this exposure math directly.
 - Apple ProRAW often starts too dark and flat in a neutral Darktable render. If `get_image_info` or `get_current_edits` recommends `apple_proraw_natural`, call `apply_starting_point` before subjective editing. Treat this as RAW normalization, not the final look.
 - Aim for bright midtones without flattening the whole image.
 - Preserve the feeling of sunlight; do not over-protect highlights until the photo becomes gloomy.

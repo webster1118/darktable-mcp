@@ -49,7 +49,43 @@ STARTING_POINTS: dict[str, dict] = {
             "sharpening_masking": 70,
             "noise_reduction": 2,
         },
-    }
+    },
+    "pweber_adobe_standard_vacation": {
+        "description": (
+            "Peter Weber's Lightroom Adobe Standard vacation baseline translated "
+            "for Darktable. Darktable's Apple ProRAW/converter base is treated as "
+            "about 1.2 EV darker than Peter's Lightroom Adobe Standard base; add "
+            "the per-photo Lightroom-style exposure decision on top."
+        ),
+        "profile_compensation_ev": 1.2,
+        "lightroom_reference": {
+            "profile": "Adobe Standard",
+            "preset": "Vacation_Preset / 01_Original_Referenz",
+            "exposure_formula": (
+                "darktable exposure_ev = 1.2 + Peter's intended per-photo exposure EV"
+            ),
+            "example": "If Peter would set Lightroom exposure to +0.2 EV, use Darktable exposure_ev +1.4.",
+        },
+        "adjustments": {
+            "exposure_ev": 1.2,
+            "brightness": 8,
+            "contrast": 13,
+            "highlights": -35,
+            "shadows": 55,
+            "whites": 24,
+            "blacks": -16,
+            "sigmoid_contrast": 10,
+            "sigmoid_skew": -4,
+            "vibrance": 14,
+            "saturation": -1,
+            "clarity": 4,
+            "dehaze": 3,
+            "sharpness": 70,
+            "sharpening_masking": 70,
+            "noise_reduction": 0,
+            "vignette": -7,
+        },
+    },
 }
 
 
@@ -842,6 +878,20 @@ def get_darktable_status() -> dict:
         "dng_conversion_mode": "auto; override with DARKTABLE_MCP_DNG_CONVERSION=auto|always|never",
         "raw_rendering": "darktable-cli" if DARKTABLE else "unavailable",
         "workflow": "bridge only; the client/Claude should decide iterative edits",
+        "personal_workflows": {
+            "pweber_lightroom_adobe_standard_vacation": {
+                "tool": "apply_pweber_lightroom_preset",
+                "profile": "pweber_adobe_standard_vacation",
+                "formula": "final_darktable_exposure_ev = 1.2 + photo_exposure_ev",
+                "order": [
+                    "apply preset",
+                    "set per-photo exposure",
+                    "set white balance",
+                    "color correction",
+                    "local masks for focus/unfocus areas",
+                ],
+            }
+        },
         "performance": {
             "dng_conversion_cache": (
                 "enabled by default; converted Apple ProRAW files are reused from "
@@ -964,6 +1014,64 @@ def apply_starting_point(
         "is_probably_apple_proraw": _looks_like_apple_proraw(path),
         "edits": state.to_dict(),
         "note": STARTING_POINTS[profile]["description"],
+    }
+
+
+@mcp.tool()
+def apply_pweber_lightroom_preset(
+    image_path: str,
+    photo_exposure_ev: float = 0.0,
+    only_if_unedited: bool = True,
+) -> dict:
+    """Apply Peter Weber's Lightroom Adobe Standard vacation baseline.
+
+    This is a concrete Darktable translation of Peter's normal Lightroom order:
+
+    1. Apply the vacation preset/profile baseline.
+    2. Set image-specific exposure.
+    3. Continue with white balance, color correction, and local masks.
+
+    Darktable's ProRAW/converter base is treated as roughly 1.2 EV below
+    Lightroom Adobe Standard, so the final MCP exposure is:
+
+    ``1.2 + photo_exposure_ev``.
+    """
+    try:
+        path, state = _load_or_new(image_path)
+    except FileNotFoundError as e:
+        return {"status": "error", "error": str(e)}
+
+    if only_if_unedited and state.has_changes():
+        return {
+            "status": "skipped",
+            "reason": "Image already has edits; pass only_if_unedited=false to replace the current baseline.",
+            "edits": state.to_dict(),
+        }
+
+    profile_name = "pweber_adobe_standard_vacation"
+    profile = STARTING_POINTS[profile_name]
+    profile_compensation_ev = float(profile["profile_compensation_ev"])
+    adjustments = dict(profile["adjustments"])
+    adjustments["exposure_ev"] = profile_compensation_ev + float(photo_exposure_ev)
+    state.update(adjustments)
+    state.save()
+
+    return {
+        "status": "ok",
+        "profile": profile_name,
+        "source_path": str(path),
+        "is_probably_apple_proraw": _looks_like_apple_proraw(path),
+        "profile_compensation_ev": profile_compensation_ev,
+        "photo_exposure_ev": float(photo_exposure_ev),
+        "final_darktable_exposure_ev": adjustments["exposure_ev"],
+        "formula": "final_darktable_exposure_ev = 1.2 + photo_exposure_ev",
+        "applied": sorted(adjustments.keys()),
+        "edits": state.to_dict(),
+        "next_steps": [
+            "Render/analyze the preset baseline before changing it.",
+            "Adjust white balance next.",
+            "Then make color correction and local focus/unfocus masks if needed.",
+        ],
     }
 
 

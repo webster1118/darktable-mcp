@@ -155,6 +155,7 @@ Claude will:
 | `get_image_info` | EXIF metadata + current edit state |
 | `get_darktable_status` | Show Darktable CLI discovery and supported v2 edit routing |
 | `apply_starting_point` | Apply a neutral ProRAW/RAW normalization starting point |
+| `apply_pweber_lightroom_preset` | Apply Peter's Lightroom Adobe Standard vacation baseline; Darktable exposure = `1.2 + photo_exposure_ev` |
 | `get_image_preview` | Render and preview with edits applied |
 | `render_and_analyze` | Render current edits and return a preview plus tone/color metrics; use `fast=true` for most feedback loops |
 | `compare_to_reference` | Compare current render metrics to a reference JPEG |
@@ -224,6 +225,12 @@ pipeline depends on live segmentation/model state.
 For Apple ProRAW files, `get_image_info` and `get_current_edits` can recommend
 the `apple_proraw_natural` starting point. This is a neutral first-pass
 normalization for Darktable's dark/flat ProRAW render, not a finished style.
+For Peter Weber's Lightroom-style vacation workflow, use
+`apply_pweber_lightroom_preset` instead: it translates the Lightroom Adobe
+Standard baseline by applying `+1.2 EV` Darktable profile compensation, then
+adds the per-photo exposure decision on top. For example, a Lightroom-style
+exposure choice of `+0.2 EV` becomes `photo_exposure_ev=0.2` and final
+Darktable `exposure_ev=1.4`.
 Final export removes MCP-generated preview/analysis files by default; use
 `cleanup_temporary_files` if you want to clean them manually. Pass
 `include_converted=true` only when you also want to remove the cached converted

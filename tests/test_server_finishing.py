@@ -21,6 +21,7 @@ from darktable_mcp.server import (
     apply_starting_point,
     cleanup_temporary_files,
     apply_edit_recipe,
+    apply_pweber_lightroom_preset,
     get_current_edits,
 )
 
@@ -355,6 +356,23 @@ class DarktableFinishingTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "skipped")
         self.assertAlmostEqual(result["edits"]["adjustments"]["exposure_ev"], 1.2)
+
+    def test_apply_pweber_lightroom_preset_adds_photo_exposure_to_profile_compensation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="darktable-mcp-pweber-preset-test-") as tmp:
+            image = Path(tmp) / "photo.dng"
+            image.write_bytes(b"placeholder dng")
+
+            result = apply_pweber_lightroom_preset(str(image), photo_exposure_ev=0.2)
+            current = get_current_edits(str(image))
+
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["profile"], "pweber_adobe_standard_vacation")
+        self.assertAlmostEqual(result["profile_compensation_ev"], 1.2)
+        self.assertAlmostEqual(result["photo_exposure_ev"], 0.2)
+        self.assertAlmostEqual(result["final_darktable_exposure_ev"], 1.4)
+        self.assertAlmostEqual(current["edits"]["adjustments"]["exposure_ev"], 1.4)
+        self.assertEqual(current["edits"]["adjustments"]["sharpness"], 70)
+        self.assertEqual(current["edits"]["adjustments"]["sharpening_masking"], 70)
 
     def test_cleanup_generated_files_removes_only_mcp_artifacts_for_source(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-clean-test-") as tmp:
