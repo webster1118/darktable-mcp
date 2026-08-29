@@ -254,7 +254,13 @@ def _encode_basicadj(brightness: float = 0.0, highlights: float = 0.0) -> str:
     }
     """
     b = max(-1.0, min(1.0, brightness / 100.0))
-    hlcompr = max(0.0, min(500.0, highlights * 5.0))
+    # The MCP exposes Lightroom-like highlights: negative values recover/darken
+    # highlights, while Darktable basic adjustments stores a *positive*
+    # highlight-compression amount.  The old mapping used the same sign, which
+    # silently turned every negative highlight adjustment into zero and made a
+    # positive value darken highlights.  Positive MCP highlight lifting is not
+    # representable by this parameter, so leave it at zero in that direction.
+    hlcompr = max(0.0, min(500.0, -highlights * 5.0))
     data = struct.pack(
         "<fffffifffff",
         0.0,       # black_point

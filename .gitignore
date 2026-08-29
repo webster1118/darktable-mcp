@@ -6,3 +6,5 @@ build/
 .venv/
 *.mcp.json
 *.xmp
+.calibration/
+calibration-results/

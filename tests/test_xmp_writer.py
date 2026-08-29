@@ -5,10 +5,24 @@ import tempfile
 import unittest
 
 from darktable_mcp.edits import CropState, EditState, LocalAdjustmentState
-from darktable_mcp.xmp_writer import local_adjustments_are_native_safe, write_xmp
+from darktable_mcp.xmp_writer import (
+    _encode_basicadj,
+    local_adjustments_are_native_safe,
+    write_xmp,
+)
 
 
 class XmpWriterTests(unittest.TestCase):
+    def test_negative_highlights_map_to_positive_darktable_compression(self) -> None:
+        params = bytes.fromhex(_encode_basicadj(brightness=0, highlights=-73))
+        _black, _exposure, compression, *_rest = struct.unpack("<fffffifffff", params)
+        self.assertAlmostEqual(compression, 365.0)
+
+    def test_positive_highlights_do_not_apply_opposite_direction_compression(self) -> None:
+        params = bytes.fromhex(_encode_basicadj(brightness=0, highlights=20))
+        _black, _exposure, compression, *_rest = struct.unpack("<fffffifffff", params)
+        self.assertEqual(compression, 0.0)
+
     def test_writes_verified_exposure_and_native_crop(self) -> None:
         with tempfile.TemporaryDirectory(prefix="darktable-mcp-xmp-test-") as tmp:
             state = EditState(source_path=Path(tmp) / "photo.dng")

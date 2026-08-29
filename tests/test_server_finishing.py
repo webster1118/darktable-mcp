@@ -371,6 +371,9 @@ class DarktableFinishingTests(unittest.TestCase):
         self.assertAlmostEqual(result["photo_exposure_ev"], 0.2)
         self.assertAlmostEqual(result["final_darktable_exposure_ev"], 1.4)
         self.assertAlmostEqual(current["edits"]["adjustments"]["exposure_ev"], 1.4)
+        self.assertEqual(current["edits"]["adjustments"]["highlights"], -73)
+        self.assertEqual(current["edits"]["adjustments"]["shadows"], 70)
+        self.assertEqual(current["edits"]["adjustments"]["contrast"], 20)
         self.assertEqual(current["edits"]["adjustments"]["sharpness"], 70)
         self.assertEqual(current["edits"]["adjustments"]["sharpening_masking"], 70)
 
